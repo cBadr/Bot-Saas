@@ -1,0 +1,30 @@
+{
+  "name": "@orca/engine",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "dotenv -e ../../.env -- tsc-watch -p tsconfig.json --onSuccess \"node dist/main.js\"",
+    "start": "dotenv -e ../../.env -- node dist/main.js",
+    "start:prod": "node dist/main.js",
+    "lint": "echo 'no lint'",
+    "type-check": "tsc --noEmit",
+    "clean": "rm -rf dist .turbo"
+  },
+  "dependencies": {
+    "@orca/config": "workspace:*",
+    "@orca/db": "workspace:*",
+    "@orca/exchange": "workspace:*",
+    "@orca/logger": "workspace:*",
+    "@orca/shared": "workspace:*",
+    "@orca/strategies": "workspace:*",
+    "ioredis": "^5.4.2",
+    "nanoid": "^3.3.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "dotenv-cli": "^8.0.0",
+    "tsc-watch": "^6.2.1",
+    "typescript": "^5.7.3"
+  }
+}

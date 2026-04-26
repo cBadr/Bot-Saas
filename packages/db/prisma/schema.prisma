@@ -1,0 +1,633 @@
+// Orca Trading Platform — Prisma Schema
+// PostgreSQL 17 + Prisma 6
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────
+
+enum UserRole {
+  USER
+  PRO
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DELETED
+  PENDING_VERIFICATION
+}
+
+enum ExchangeName {
+  BINANCE
+}
+
+enum ApiKeyStatus {
+  ACTIVE
+  DISABLED
+  INVALID
+}
+
+enum BotStatus {
+  CREATED
+  STARTING
+  RUNNING
+  PAUSED
+  STOPPING
+  STOPPED
+  ERROR
+}
+
+enum StrategyType {
+  GRID
+  DCA
+  CUSTOM
+}
+
+enum StrategyVisibility {
+  BUILTIN
+  PRIVATE
+  PUBLIC
+}
+
+enum OrderSide {
+  BUY
+  SELL
+}
+
+enum OrderType {
+  LIMIT
+  LIMIT_MAKER
+}
+
+enum OrderStatus {
+  NEW
+  PARTIALLY_FILLED
+  FILLED
+  CANCELED
+  PENDING_CANCEL
+  REJECTED
+  EXPIRED
+  EXPIRED_IN_MATCH
+}
+
+enum SubscriptionStatus {
+  TRIAL
+  ACTIVE
+  PAST_DUE
+  CANCELED
+  EXPIRED
+}
+
+enum PaymentStatus {
+  PENDING
+  CONFIRMING
+  COMPLETED
+  FAILED
+  REFUNDED
+  CANCELED
+}
+
+enum NotificationChannel {
+  TELEGRAM
+  EMAIL
+  DISCORD
+  IN_APP
+}
+
+enum LogLevel {
+  TRACE
+  DEBUG
+  INFO
+  WARN
+  ERROR
+  FATAL
+}
+
+enum LogCategory {
+  APP
+  TRADE
+  API
+  BINANCE
+  AUDIT
+  BOT
+  STRATEGY
+  PAYMENT
+  AUTH
+  SYSTEM
+}
+
+// ─────────────────────────────────────────────────────
+// Users & Auth
+// ─────────────────────────────────────────────────────
+
+model User {
+  id              String     @id @default(cuid())
+  email           String     @unique
+  emailVerifiedAt DateTime?
+  passwordHash    String
+  fullName        String?
+  avatarUrl       String?
+  role            UserRole   @default(USER)
+  status          UserStatus @default(ACTIVE)
+
+  twoFactorEnabled Boolean @default(false)
+  twoFactorSecret  String?
+
+  telegramChatId  String?
+  telegramUsername String?
+
+  referralCode  String? @unique
+  referredById  String?
+  referredBy    User?   @relation("UserReferrals", fields: [referredById], references: [id])
+  referrals     User[]  @relation("UserReferrals")
+
+  lastLoginAt DateTime?
+  lastLoginIp String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sessions       Session[]
+  passwordResetTokens PasswordResetToken[]
+  apiKeys        ExchangeApiKey[]
+  bots           Bot[]
+  strategies     Strategy[]
+  subscriptions  Subscription[]
+  payments       Payment[]
+  notifications  NotificationPreference[]
+  notificationLogs NotificationLog[]
+  auditLogs      AuditLog[]
+  systemLogs     SystemLog[]
+
+  @@index([role])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  userId       String
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshToken String   @unique
+  userAgent    String?
+  ipAddress    String?
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  createdAt    DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ─────────────────────────────────────────────────────
+// Exchange API Keys
+// ─────────────────────────────────────────────────────
+
+model ExchangeApiKey {
+  id          String       @id @default(cuid())
+  userId      String
+  user        User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  exchange    ExchangeName @default(BINANCE)
+  label       String
+  apiKey      String
+  apiSecret   String
+  status      ApiKeyStatus @default(ACTIVE)
+  permissions Json?
+  lastCheckedAt DateTime?
+  lastError   String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  bots Bot[]
+
+  @@index([userId])
+  @@index([status])
+}
+
+// ─────────────────────────────────────────────────────
+// Strategies
+// ─────────────────────────────────────────────────────
+
+model Strategy {
+  id          String             @id @default(cuid())
+  ownerId    String?
+  owner       User?              @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  name        String
+  description String?
+  type        StrategyType
+  visibility  StrategyVisibility @default(PRIVATE)
+  version     Int                @default(1)
+
+  // For built-in strategies: code identifier (e.g., "grid_v1")
+  builtinKey String?
+
+  // For custom strategies: visual graph definition (nodes/edges) or JSON config
+  definition Json
+  // Default parameters schema (zod-like JSON)
+  paramsSchema Json?
+
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  bots Bot[]
+
+  @@index([ownerId])
+  @@index([type])
+  @@index([visibility])
+  @@unique([builtinKey])
+}
+
+// ─────────────────────────────────────────────────────
+// Bots
+// ─────────────────────────────────────────────────────
+
+model Bot {
+  id          String    @id @default(cuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  apiKeyId    String
+  apiKey      ExchangeApiKey @relation(fields: [apiKeyId], references: [id], onDelete: Restrict)
+  strategyId  String
+  strategy    Strategy  @relation(fields: [strategyId], references: [id], onDelete: Restrict)
+
+  name        String
+  symbol      String        // e.g., "BTCFDUSD"
+  baseAsset   String
+  quoteAsset  String
+
+  status      BotStatus     @default(CREATED)
+
+  /// When true, bot runs in simulated mode (no real Binance orders)
+  paperTrading Boolean      @default(false)
+
+  /// Auto-stop if daily realized loss exceeds this many quote units (positive number)
+  dailyLossLimit Decimal?   @db.Decimal(36, 18)
+  /// Auto-stop if drawdown from running peak exceeds this percentage (e.g. 10 = 10%)
+  maxDrawdownPct Decimal?   @db.Decimal(10, 6)
+
+  // User-tuned parameters for this bot instance
+  params      Json
+  // Risk management settings
+  riskConfig  Json?
+
+  // Runtime state
+  state       Json?
+  workerId    String?
+  startedAt   DateTime?
+  stoppedAt   DateTime?
+  lastErrorAt DateTime?
+  lastError   String?
+
+  // Aggregated stats (cached for fast dashboard queries)
+  totalTrades       Int      @default(0)
+  totalVolumeQuote  Decimal  @default(0) @db.Decimal(36, 18)
+  realizedPnlQuote  Decimal  @default(0) @db.Decimal(36, 18)
+  unrealizedPnlQuote Decimal @default(0) @db.Decimal(36, 18)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  orders       Order[]
+  trades       Trade[]
+  events       BotEvent[]
+  performance  BotPerformanceSnapshot[]
+
+  @@index([userId])
+  @@index([status])
+  @@index([symbol])
+  @@index([userId, status])
+}
+
+model BotEvent {
+  id        String   @id @default(cuid())
+  botId     String
+  bot       Bot      @relation(fields: [botId], references: [id], onDelete: Cascade)
+  type      String   // STARTED, STOPPED, ERROR, ORDER_PLACED, ORDER_FILLED, etc.
+  message   String
+  data      Json?
+  createdAt DateTime @default(now())
+
+  @@index([botId, createdAt(sort: Desc)])
+  @@index([type])
+}
+
+model BotPerformanceSnapshot {
+  id              String   @id @default(cuid())
+  botId           String
+  bot             Bot      @relation(fields: [botId], references: [id], onDelete: Cascade)
+  snapshotAt      DateTime @default(now())
+  equityQuote     Decimal  @db.Decimal(36, 18)
+  realizedPnl     Decimal  @db.Decimal(36, 18)
+  unrealizedPnl   Decimal  @db.Decimal(36, 18)
+  drawdownPct     Decimal  @db.Decimal(10, 6)
+  totalTrades     Int
+  winningTrades   Int
+  losingTrades    Int
+
+  @@index([botId, snapshotAt(sort: Desc)])
+}
+
+// ─────────────────────────────────────────────────────
+// Orders & Trades
+// ─────────────────────────────────────────────────────
+
+model Order {
+  id              String      @id @default(cuid())
+  botId           String
+  bot             Bot         @relation(fields: [botId], references: [id], onDelete: Cascade)
+
+  exchange        ExchangeName @default(BINANCE)
+  symbol          String
+  clientOrderId   String      @unique
+  exchangeOrderId String?
+  side            OrderSide
+  type            OrderType   @default(LIMIT)
+  status          OrderStatus @default(NEW)
+
+  price           Decimal     @db.Decimal(36, 18)
+  quantity        Decimal     @db.Decimal(36, 18)
+  filledQuantity  Decimal     @default(0) @db.Decimal(36, 18)
+  cumulativeQuote Decimal     @default(0) @db.Decimal(36, 18)
+
+  gridLevel       Int?
+  meta            Json?
+
+  placedAt        DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  filledAt        DateTime?
+  canceledAt      DateTime?
+
+  trades Trade[]
+
+  @@index([botId, status])
+  @@index([exchangeOrderId])
+  @@index([symbol, status])
+  @@index([placedAt])
+}
+
+model Trade {
+  id              String   @id @default(cuid())
+  botId           String
+  bot             Bot      @relation(fields: [botId], references: [id], onDelete: Cascade)
+  orderId         String
+  order           Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  exchangeTradeId String
+  symbol          String
+  side            OrderSide
+  price           Decimal  @db.Decimal(36, 18)
+  quantity        Decimal  @db.Decimal(36, 18)
+  quoteQuantity   Decimal  @db.Decimal(36, 18)
+  commission      Decimal  @default(0) @db.Decimal(36, 18)
+  commissionAsset String?
+  isMaker         Boolean  @default(true)
+  realizedPnl     Decimal? @db.Decimal(36, 18)
+
+  executedAt      DateTime
+  createdAt       DateTime @default(now())
+
+  @@unique([exchangeTradeId, symbol])
+  @@index([botId, executedAt(sort: Desc)])
+  @@index([symbol])
+}
+
+// ─────────────────────────────────────────────────────
+// Subscriptions & Payments (CoinPayments)
+// ─────────────────────────────────────────────────────
+
+model Plan {
+  id           String   @id @default(cuid())
+  code         String   @unique // e.g., "free", "starter", "pro", "elite"
+  name         String
+  description  String?
+  priceUsd     Decimal  @db.Decimal(12, 2)
+  billingCycleDays Int  @default(30)
+  isActive     Boolean  @default(true)
+  sortOrder    Int      @default(0)
+
+  // Limits
+  maxBots          Int @default(1)
+  maxApiKeys       Int @default(1)
+  maxCustomStrategies Int @default(0)
+  features         Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  subscriptions Subscription[]
+}
+
+model Subscription {
+  id        String             @id @default(cuid())
+  userId    String
+  user      User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  planId    String
+  plan      Plan               @relation(fields: [planId], references: [id])
+
+  status         SubscriptionStatus @default(TRIAL)
+  startsAt       DateTime           @default(now())
+  endsAt         DateTime
+  canceledAt     DateTime?
+  autoRenew      Boolean            @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  payments Payment[]
+
+  @@index([userId, status])
+  @@index([endsAt])
+}
+
+model Payment {
+  id              String        @id @default(cuid())
+  userId          String
+  user            User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subscriptionId  String?
+  subscription    Subscription? @relation(fields: [subscriptionId], references: [id])
+
+  provider        String        @default("coinpayments")
+  providerTxnId   String?       @unique
+  amountUsd       Decimal       @db.Decimal(12, 2)
+  amountCrypto    Decimal?      @db.Decimal(36, 18)
+  cryptoCurrency  String?
+  status          PaymentStatus @default(PENDING)
+  ipnRaw          Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  paidAt    DateTime?
+
+  @@index([userId])
+  @@index([status])
+}
+
+// ─────────────────────────────────────────────────────
+// Notifications
+// ─────────────────────────────────────────────────────
+
+model NotificationPreference {
+  id        String              @id @default(cuid())
+  userId    String
+  user      User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  channel   NotificationChannel
+  eventType String
+  enabled   Boolean             @default(true)
+  config    Json?
+
+  @@unique([userId, channel, eventType])
+}
+
+model NotificationLog {
+  id        String              @id @default(cuid())
+  userId    String
+  user      User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  channel   NotificationChannel
+  eventType String
+  payload   Json
+  success   Boolean
+  error     String?
+  createdAt DateTime            @default(now())
+
+  @@index([userId, createdAt(sort: Desc)])
+}
+
+// ─────────────────────────────────────────────────────
+// Logging & Audit
+// ─────────────────────────────────────────────────────
+
+model SystemLog {
+  id        String      @id @default(cuid())
+  level     LogLevel
+  category  LogCategory
+  message   String
+  data      Json?
+  userId    String?
+  user      User?       @relation(fields: [userId], references: [id], onDelete: SetNull)
+  botId     String?
+  requestId String?
+  service   String?
+  createdAt DateTime    @default(now())
+
+  @@index([level])
+  @@index([category])
+  @@index([createdAt(sort: Desc)])
+  @@index([userId])
+  @@index([botId])
+}
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  userId      String?
+  user        User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  actorType   String   // USER, ADMIN, SYSTEM
+  action      String   // e.g., "bot.create", "user.login", "api_key.delete"
+  targetType  String?
+  targetId    String?
+  ipAddress   String?
+  userAgent   String?
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([action])
+  @@index([targetType, targetId])
+}
+
+model BinanceApiCallLog {
+  id           String   @id @default(cuid())
+  endpoint     String
+  method       String
+  statusCode   Int?
+  durationMs   Int?
+  weightUsed   Int?
+  apiKeyId     String?
+  botId        String?
+  errorCode    Int?
+  errorMessage String?
+  requestData  Json?
+  responseData Json?
+  createdAt    DateTime @default(now())
+
+  @@index([apiKeyId, createdAt(sort: Desc)])
+  @@index([endpoint])
+  @@index([statusCode])
+}
+
+// ─────────────────────────────────────────────────────
+// Platform Settings (Admin-tunable)
+// ─────────────────────────────────────────────────────
+
+model AppSetting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     Json
+  category  String?
+  isPublic  Boolean  @default(false)
+  updatedAt DateTime @updatedAt
+
+  @@index([category])
+}
+
+model FeatureFlag {
+  id           String   @id @default(cuid())
+  key          String   @unique
+  enabled      Boolean  @default(false)
+  description  String?
+  rolloutPct   Int      @default(0)
+  // Optional list of userIds to specifically include
+  allowList    String[]
+  updatedAt    DateTime @updatedAt
+}
+
+// ─────────────────────────────────────────────────────
+// Exchange metadata cache (symbols, filters)
+// ─────────────────────────────────────────────────────
+
+model ExchangeSymbol {
+  id              String       @id @default(cuid())
+  exchange        ExchangeName @default(BINANCE)
+  symbol          String
+  baseAsset       String
+  quoteAsset      String
+  status          String
+  baseAssetPrecision  Int
+  quoteAssetPrecision Int
+  tickSize        Decimal      @db.Decimal(36, 18)
+  stepSize        Decimal      @db.Decimal(36, 18)
+  minNotional     Decimal      @db.Decimal(36, 18)
+  minQty          Decimal      @db.Decimal(36, 18)
+  maxQty          Decimal      @db.Decimal(36, 18)
+  isSpotTradingAllowed Boolean @default(true)
+  rawFilters      Json
+  updatedAt       DateTime     @updatedAt
+
+  @@unique([exchange, symbol])
+  @@index([quoteAsset])
+}
