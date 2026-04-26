@@ -5,14 +5,17 @@ import type { Strategy, StrategyContext, StrategyOrderEvent } from '../base';
 import { GridSimpleParamsSchema, type GridSimpleParams } from './params';
 
 interface SimpleOrder {
-  /** 'pending' | 'open' | 'ignored_balance' | 'error' */
+  /**
+   * pending | open | ignored_balance | post_only_rejected | price_too_far |
+   * min_notional | bad_price | bad_qty | error
+   */
   status: string;
   side: 'BUY' | 'SELL';
   price: string;
   quantity: string;
   clientOrderId?: string;
   orderId?: number;
-  lastError?: { code?: number; msg?: string; ts: number };
+  lastError?: { code?: number; category?: string; msg?: string; ts: number };
 }
 
 interface UnmatchedBuy {
@@ -43,6 +46,156 @@ interface GridSimpleState {
 
 const RECONCILE_EVERY_MS = 5 * 60 * 1000;
 const MAX_PROCESSED_FILLS = 1000;
+
+/**
+ * Categorize a Binance / network error into a structured class so we can:
+ *  - decide retry strategy (transient vs permanent)
+ *  - aggregate similar errors into one human-readable summary
+ *  - give the user an actionable hint
+ */
+type ErrorCategory =
+  | 'INSUFFICIENT_BALANCE'  // -2010 with "insufficient balance"
+  | 'POST_ONLY_REJECTED'    // -2010/-2011 with "would immediately match"
+  | 'MIN_NOTIONAL'          // -1013 NOTIONAL filter — order value too small
+  | 'PRICE_FILTER'          // -1013 PRICE_FILTER — tick rounding
+  | 'LOT_SIZE'              // -1013 LOT_SIZE — step rounding
+  | 'PERCENT_PRICE'         // -1013 PERCENT_PRICE_BY_SIDE — too far from market
+  | 'FILTER_OTHER'          // -1013 other filter
+  | 'RATE_LIMIT'            // -1003 / 429 / 418
+  | 'TIMESTAMP'             // -1021 timestamp out of recv window
+  | 'NETWORK'               // ECONNRESET, ETIMEDOUT, EAI_AGAIN, etc.
+  | 'AUTH'                  // -2014/-2015/-1022
+  | 'BAD_REQUEST'           // -1100/-1102/-1106/-1130 — programmer/data bug
+  | 'DUPLICATE_ORDER'       // -2010 with "Duplicate order"
+  | 'UNKNOWN';
+
+interface ClassifiedError {
+  category: ErrorCategory;
+  code?: number;
+  msg: string;
+  /** Whether reconcile/init should retry this order with same params. */
+  retryable: boolean;
+  /** Whether we should immediately retry inside placeOrder (with backoff). */
+  transientRetry: boolean;
+  /** Whether the bot must stop. */
+  fatal: boolean;
+  /** Operator-facing actionable hint. */
+  hint: string;
+}
+
+function classifyError(err: unknown): ClassifiedError {
+  const e = err as {
+    response?: { data?: { code?: number; msg?: string }; status?: number };
+    message?: string;
+    code?: string;
+  };
+  const httpStatus = e.response?.status;
+  const code = e.response?.data?.code;
+  const msg = e.response?.data?.msg ?? e.message ?? String(err);
+  const sysCode = e.code; // Node syscall errors like ECONNRESET
+
+  // Network / system errors
+  if (sysCode && /^(ECONN|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|EPIPE|ESOCKETTIMEDOUT)/.test(sysCode)) {
+    return { category: 'NETWORK', msg: `${sysCode}: ${msg}`, retryable: true, transientRetry: true, fatal: false,
+      hint: 'Network blip — will retry automatically.' };
+  }
+
+  // Rate limit
+  if (code === -1003 || httpStatus === 429 || httpStatus === 418) {
+    return { category: 'RATE_LIMIT', code, msg, retryable: true, transientRetry: true, fatal: false,
+      hint: 'Hit Binance rate limit — backing off.' };
+  }
+
+  // Timestamp
+  if (code === -1021) {
+    return { category: 'TIMESTAMP', code, msg, retryable: true, transientRetry: true, fatal: false,
+      hint: 'Server time drift — will resync and retry.' };
+  }
+
+  // Auth — fatal
+  if (code === -2014 || code === -2015 || code === -1022) {
+    return { category: 'AUTH', code, msg, retryable: false, transientRetry: false, fatal: true,
+      hint: 'API key invalid, expired, or missing required permissions. Edit the key in Settings.' };
+  }
+
+  // Bad request — programmer / data bug, fatal
+  if (code === -1100 || code === -1102 || code === -1106 || code === -1130) {
+    return { category: 'BAD_REQUEST', code, msg, retryable: false, transientRetry: false, fatal: false,
+      hint: 'Malformed order request — please report this bug.' };
+  }
+
+  // -2010 family — distinguish by message
+  if (code === -2010 || code === -2011) {
+    if (/duplicate order/i.test(msg)) {
+      return { category: 'DUPLICATE_ORDER', code, msg, retryable: false, transientRetry: false, fatal: false,
+        hint: 'Duplicate clientOrderId — likely a race condition; reconcile will resync.' };
+    }
+    if (/immediately match/i.test(msg) || /post[- ]?only/i.test(msg)) {
+      return { category: 'POST_ONLY_REJECTED', code, msg, retryable: true, transientRetry: false, fatal: false,
+        hint: 'Order price would cross the book. Widen gridSpread or wait for the market to drift.' };
+    }
+    if (/insufficient balance/i.test(msg)) {
+      return { category: 'INSUFFICIENT_BALANCE', code, msg, retryable: true, transientRetry: false, fatal: false,
+        hint: 'Not enough free balance. Reconcile retries every 5 minutes as funds free up.' };
+    }
+    // -2010 with other text → treat as transient unknown
+    return { category: 'UNKNOWN', code, msg, retryable: true, transientRetry: false, fatal: false,
+      hint: 'Order rejected by exchange. Check the message.' };
+  }
+
+  // Filter failures
+  if (code === -1013) {
+    if (/min[_ ]?notional/i.test(msg) || /notional/i.test(msg)) {
+      return { category: 'MIN_NOTIONAL', code, msg, retryable: false, transientRetry: false, fatal: false,
+        hint: 'orderSize too small for this price level. Increase orderSize.' };
+    }
+    if (/price[_ ]?filter/i.test(msg)) {
+      return { category: 'PRICE_FILTER', code, msg, retryable: false, transientRetry: false, fatal: false,
+        hint: 'Price violates tick rules — please report this bug.' };
+    }
+    if (/lot[_ ]?size/i.test(msg)) {
+      return { category: 'LOT_SIZE', code, msg, retryable: false, transientRetry: false, fatal: false,
+        hint: 'Quantity violates step rules — please report this bug.' };
+    }
+    if (/percent[_ ]?price/i.test(msg) || /price.*too.*(low|high)/i.test(msg)) {
+      return { category: 'PERCENT_PRICE', code, msg, retryable: true, transientRetry: false, fatal: false,
+        hint: 'Price too far from current market. Reconcile will retry as market moves closer.' };
+    }
+    return { category: 'FILTER_OTHER', code, msg, retryable: true, transientRetry: true, fatal: false,
+      hint: 'Filter rejection — will retry once.' };
+  }
+
+  return { category: 'UNKNOWN', code, msg, retryable: false, transientRetry: false, fatal: false,
+    hint: 'Unrecognized error — see message.' };
+}
+
+/** Map a category → status string stored on the SimpleOrder. */
+function statusForCategory(cat: ErrorCategory): string {
+  switch (cat) {
+    case 'INSUFFICIENT_BALANCE': return 'ignored_balance';
+    case 'POST_ONLY_REJECTED':   return 'post_only_rejected';
+    case 'PERCENT_PRICE':        return 'price_too_far';
+    case 'MIN_NOTIONAL':         return 'min_notional';
+    case 'PRICE_FILTER':         return 'bad_price';
+    case 'LOT_SIZE':             return 'bad_qty';
+    default:                     return 'error';
+  }
+}
+
+/** Group an array of errors into `{ category: count, sample }` for one-shot reporting. */
+function summarizeErrors(errors: ClassifiedError[]): Array<{
+  category: ErrorCategory; count: number; code?: number; sampleMsg: string; hint: string;
+}> {
+  const groups = new Map<ErrorCategory, { count: number; code?: number; sample: ClassifiedError }>();
+  for (const e of errors) {
+    const g = groups.get(e.category);
+    if (g) g.count++;
+    else groups.set(e.category, { count: 1, code: e.code, sample: e });
+  }
+  return [...groups.entries()].map(([category, g]) => ({
+    category, count: g.count, code: g.code, sampleMsg: g.sample.msg, hint: g.sample.hint,
+  }));
+}
 
 /**
  * Per-bot async mutex to serialize ALL state mutations within a single
@@ -86,19 +239,21 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
   }
 
   /**
-   * Try to place an order. Handles:
-   *  - Real insufficient balance → mark `ignored_balance`, reconcile retries.
-   *  - Post-only rejection ("would immediately match") → re-price 1 tick further
-   *    from the market and retry once; if still rejected, mark `post_only_rejected`
-   *    (NOT retried — the spread is too tight; user needs to widen).
-   *  - Filter failure → one 3s retry with same params.
-   *  - Auth error → fatal throw.
-   *  - Other → mark `error`.
+   * Try to place an order. Routes errors through `classifyError` and:
+   *  - transient (network/rate-limit/timestamp) → exponential backoff retry up to 3x
+   *  - post-only rejection → re-price 1 tick further from market, up to 2x
+   *  - permanent (insufficient/min_notional/etc) → mark with category-specific status
+   *  - fatal (auth) → throw to abort the bot
+   *
+   * All errors are surfaced both on `order.lastError` (for inspection) and as
+   * BotEvents (for the activity log). Aggregate summaries are emitted by the
+   * caller via `summarizeAndEmit` so 15 identical errors collapse into 1 event.
    */
   private async _placeOrderAttempt(
     ctx: StrategyContext,
     order: SimpleOrder,
-    repriceAttempts: number,
+    repriceAttempts = 0,
+    transientAttempts = 0,
   ): Promise<void> {
     const cid = `orca-${this.tag(ctx)}-${order.side === 'BUY' ? 'b' : 's'}-${randomUUID().slice(0, 6)}`;
     try {
@@ -119,97 +274,90 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
         clientOrderId: cid, exchangeOrderId: res.orderId,
       });
     } catch (err) {
-      const e = err as { response?: { data?: { code?: number; msg?: string } }; message?: string };
-      const code = e.response?.data?.code;
-      const msg = e.response?.data?.msg ?? e.message ?? String(err);
+      const c = classifyError(err);
 
-      // Fatal — auth error.
-      if (code === -2014 || code === -2015) {
-        ctx.logger.error('Fatal API key error — bot must stop', { code, msg });
-        await ctx.emit('FATAL_API_ERROR', `Fatal: ${msg}`, { code });
+      // Fatal — auth. Bubble up so the runner marks the bot as ERROR.
+      if (c.fatal) {
+        ctx.logger.error('Fatal placement error', {
+          errCategory: c.category, code: c.code, msg: c.msg, hint: c.hint,
+        });
+        await ctx.emit('FATAL_API_ERROR', `Fatal [${c.category}]: ${c.msg}`,
+          { category: c.category, code: c.code, hint: c.hint });
         throw err;
       }
 
-      // Distinguish post-only rejection from insufficient balance —
-      // both can return -2010, but the message tells them apart.
-      const wouldMatch =
-        /immediately match/i.test(msg) ||
-        /post[- ]?only/i.test(msg) ||
-        code === -2011 ||
-        msg.includes('Order would trigger immediately');
-      const realInsufficient =
-        !wouldMatch && (/insufficient balance/i.test(msg) || code === -2010);
-
-      if (wouldMatch) {
-        // Re-price one tick further from the market and retry once.
-        if (repriceAttempts < 2) {
-          const tick = new Decimal(ctx.filters.tickSize);
-          const adj = order.side === 'BUY'
-            ? new Decimal(order.price).minus(tick)
-            : new Decimal(order.price).plus(tick);
-          if (adj.lte(0)) {
-            order.status = 'post_only_rejected';
-            order.lastError = { code, msg, ts: Date.now() };
-            return;
-          }
-          const newPrice = roundToTickSize(adj, ctx.filters.tickSize);
-          ctx.logger.info('Post-only rejection — re-pricing 1 tick away', {
-            side: order.side, oldPrice: order.price, newPrice, attempt: repriceAttempts + 1,
-          });
-          // Recompute qty so quote spend stays close to orderSize. Use the original
-          // order.quantity * (oldPrice / newPrice) ratio? Simpler: re-use same qty.
-          order.price = newPrice;
-          await this._placeOrderAttempt(ctx, order, repriceAttempts + 1);
-          return;
-        }
-        // Two re-prices failed → spread is too tight relative to current book.
-        ctx.logger.warn('Order skipped: too close to market for LIMIT_MAKER', {
-          side: order.side, price: order.price, msg,
+      // Transient — exponential backoff retry (max 3 attempts).
+      if (c.transientRetry && transientAttempts < 3) {
+        const backoffMs = 250 * Math.pow(2, transientAttempts);
+        ctx.logger.warn(`Transient error [${c.category}], retrying in ${backoffMs}ms`, {
+          attempt: transientAttempts + 1, errCategory: c.category, msg: c.msg,
         });
-        order.status = 'post_only_rejected';
-        order.lastError = { code, msg, ts: Date.now() };
-        await ctx.emit('ORDER_SKIPPED_POST_ONLY',
-          `${order.side} @ ${order.price} skipped — too close to market. Widen gridSpread.`,
-          { side: order.side, price: order.price });
+        await new Promise((r) => setTimeout(r, backoffMs));
+        await this._placeOrderAttempt(ctx, order, repriceAttempts, transientAttempts + 1);
         return;
       }
 
-      if (realInsufficient) {
-        // Real lack of balance — reconcile loop retries with same price/qty.
-        order.status = 'ignored_balance';
-        order.lastError = { code, msg, ts: Date.now() };
-        return;
-      }
-
-      // Filter failure — usually slippage. One short retry.
-      if (code === -1013) {
-        ctx.logger.warn('Filter failure, retrying once after 3s', { side: order.side, price: order.price, msg });
-        await new Promise((r) => setTimeout(r, 3000));
-        try {
-          const cid2 = `orca-${this.tag(ctx)}-${order.side === 'BUY' ? 'b' : 's'}r-${randomUUID().slice(0, 6)}`;
-          const res = await ctx.client.placeOrder({
-            symbol: ctx.symbol,
-            side: order.side,
-            type: 'LIMIT_MAKER',
-            price: order.price,
-            quantity: order.quantity,
-            newClientOrderId: cid2,
-          });
-          order.clientOrderId = cid2;
-          order.orderId = res.orderId;
-          order.status = 'open';
-          return;
-        } catch (e2) {
-          ctx.logger.warn('Retry failed for filter error', { err: String(e2) });
-          order.status = 'error';
+      // Post-only rejection — try re-pricing 1 tick further from market (up to 2 attempts).
+      if (c.category === 'POST_ONLY_REJECTED' && repriceAttempts < 2) {
+        const tick = new Decimal(ctx.filters.tickSize);
+        const adj = order.side === 'BUY'
+          ? new Decimal(order.price).minus(tick)
+          : new Decimal(order.price).plus(tick);
+        if (adj.lte(0)) {
+          order.status = 'post_only_rejected';
+          order.lastError = { code: c.code, category: c.category, msg: c.msg, ts: Date.now() };
           return;
         }
+        const newPrice = roundToTickSize(adj, ctx.filters.tickSize);
+        ctx.logger.info('Post-only rejection — re-pricing 1 tick away', {
+          side: order.side, oldPrice: order.price, newPrice, attempt: repriceAttempts + 1,
+        });
+        order.price = newPrice;
+        await this._placeOrderAttempt(ctx, order, repriceAttempts + 1, transientAttempts);
+        return;
       }
 
-      ctx.logger.warn('Order placement failed', { side: order.side, price: order.price, msg });
-      order.status = 'error';
-      order.lastError = { code, msg, ts: Date.now() };
+      // Permanent / will-be-retried-by-reconcile — mark status & store error.
+      order.status = statusForCategory(c.category);
+      order.lastError = { code: c.code, category: c.category, msg: c.msg, ts: Date.now() };
+      ctx.logger.warn('Order placement failed', {
+        side: order.side, price: order.price, errCategory: c.category, code: c.code, msg: c.msg, hint: c.hint,
+      });
     }
+  }
+
+  /**
+   * After a batch placement, group errors by category and emit ONE summary
+   * event per category — so 15 "INSUFFICIENT_BALANCE" rejections become a
+   * single "GRID_PLACEMENT_ERRORS" event the user can read at a glance.
+   */
+  private async summarizeAndEmit(
+    ctx: StrategyContext,
+    orders: SimpleOrder[],
+    phase: 'init' | 'reconcile' | 'counter',
+  ): Promise<void> {
+    const errors: ClassifiedError[] = orders
+      .filter((o) => o.lastError && o.status !== 'open')
+      .map((o) => ({
+        category: (o.lastError?.category as ErrorCategory) ?? 'UNKNOWN',
+        code: o.lastError?.code,
+        msg: o.lastError?.msg ?? 'unknown',
+        retryable: o.status === 'ignored_balance' || o.status === 'post_only_rejected' || o.status === 'price_too_far',
+        transientRetry: false,
+        fatal: false,
+        hint: '',
+      }));
+    if (errors.length === 0) return;
+    const summary = summarizeErrors(errors);
+    const lines = summary.map((s) =>
+      `${s.count}× ${s.category}${s.code ? ` (${s.code})` : ''}: ${s.sampleMsg.slice(0, 120)}`,
+    );
+    const headline = `Phase=${phase}: ${errors.length} order(s) had errors across ${summary.length} categor${summary.length === 1 ? 'y' : 'ies'}`;
+    await ctx.emit('GRID_PLACEMENT_ERRORS', `${headline} — ${lines.join(' | ')}`, {
+      phase,
+      total: errors.length,
+      summary,
+    });
   }
 
   async init(ctx: StrategyContext, params: GridSimpleParams): Promise<void> {
@@ -284,15 +432,19 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
       const chunk = orders.slice(i, i + CHUNK_SIZE);
       await Promise.allSettled(chunk.map((o) => this.placeOrder(ctx, o)));
     }
-    const placed = orders.filter((o) => o.status === 'open').length;
-    const skipped = orders.filter((o) => o.status === 'ignored_balance').length;
-    const errored = orders.filter((o) => o.status === 'error').length;
+    const breakdown: Record<string, number> = {};
+    for (const o of orders) breakdown[o.status] = (breakdown[o.status] ?? 0) + 1;
+    const placed = breakdown['open'] ?? 0;
     ctx.logger.info('Initial grid placed', {
-      total: orders.length, placed, skipped, errored, ms: Date.now() - t0,
+      total: orders.length, placed, breakdown, ms: Date.now() - t0,
     });
+    const breakdownStr = Object.entries(breakdown)
+      .map(([k, v]) => `${k}=${v}`).join(', ');
     await ctx.emit('GRID_PLACEMENT_DONE',
-      `Placed ${placed}/${orders.length} (skipped ${skipped}, errored ${errored}) in ${Date.now() - t0}ms`,
-      { placed, skipped, errored });
+      `Placed ${placed}/${orders.length} in ${Date.now() - t0}ms (${breakdownStr})`,
+      { placed, total: orders.length, breakdown });
+    // Emit per-category error summary so the user sees exactly what went wrong.
+    await this.summarizeAndEmit(ctx, orders, 'init');
 
     const state: GridSimpleState = {
       initialStartPrice: startPrice,
@@ -402,6 +554,15 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
     if (counter) {
       state.orders.push(counter);
       await this.placeOrder(ctx, counter);
+      // If counter placement failed, surface it as a single-order summary event.
+      if (counter.status !== 'open' && counter.lastError) {
+        await ctx.emit('COUNTER_ORDER_FAILED',
+          `Counter ${counter.side} @ ${counter.price} failed: ${counter.lastError.category ?? 'UNKNOWN'} — ${(counter.lastError.msg ?? '').slice(0, 120)}`,
+          {
+            side: counter.side, price: counter.price, quantity: counter.quantity,
+            category: counter.lastError.category, code: counter.lastError.code, msg: counter.lastError.msg,
+          });
+      }
     }
     return true;
   }
@@ -464,16 +625,14 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
     if (!state) return;
     if (!Array.isArray(state.processedFills)) state.processedFills = [];
 
-    // 1) Retry balance-skipped AND post-only-rejected orders.
-    //    The market may have moved away from these prices, freeing them up.
-    const retryable = state.orders.filter(
-      (o) => o.status === 'ignored_balance' || o.status === 'post_only_rejected',
-    );
+    // 1) Retry orders that previously failed for retryable reasons.
+    //    The market may have moved or balance may have freed up since.
+    const RETRY_STATUSES = ['ignored_balance', 'post_only_rejected', 'price_too_far'];
+    const retryable = state.orders.filter((o) => RETRY_STATUSES.includes(o.status));
     if (retryable.length > 0) {
-      ctx.logger.info(`Retrying ${retryable.length} skipped orders`, {
-        balance: retryable.filter((o) => o.status === 'ignored_balance').length,
-        postOnly: retryable.filter((o) => o.status === 'post_only_rejected').length,
-      });
+      const byStatus: Record<string, number> = {};
+      for (const o of retryable) byStatus[o.status] = (byStatus[o.status] ?? 0) + 1;
+      ctx.logger.info(`Retrying ${retryable.length} skipped orders`, byStatus);
       for (const o of retryable) {
         o.status = 'pending';
         delete o.lastError;
@@ -482,6 +641,12 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
       for (let i = 0; i < retryable.length; i += CHUNK) {
         await Promise.allSettled(retryable.slice(i, i + CHUNK).map((o) => this.placeOrder(ctx, o)));
       }
+      const recovered = retryable.filter((o) => o.status === 'open').length;
+      const stillBad = retryable.length - recovered;
+      await ctx.emit('GRID_RECONCILE_RETRY',
+        `Reconcile retry: ${recovered}/${retryable.length} recovered (${stillBad} still skipped)`,
+        { recovered, stillBad, total: retryable.length });
+      if (stillBad > 0) await this.summarizeAndEmit(ctx, retryable, 'reconcile');
     }
 
     // 2) Reconcile vs exchange
