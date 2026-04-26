@@ -44,7 +44,14 @@ interface GridSimpleState {
   processedFills: string[];
 }
 
-const RECONCILE_EVERY_MS = 5 * 60 * 1000;
+/**
+ * How often the integrity loop runs. Every minute we verify:
+ *   1. Every order in our state is actually open on Binance.
+ *   2. Any non-open orders are retried at their ORIGINAL spec price
+ *      (we never mutate the grid level — if the price can't be placed
+ *      right now, we wait for the next tick and try again).
+ */
+const RECONCILE_EVERY_MS = 60 * 1000;
 const MAX_PROCESSED_FILLS = 1000;
 
 /**
@@ -241,8 +248,9 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
   /**
    * Try to place an order. Routes errors through `classifyError` and:
    *  - transient (network/rate-limit/timestamp) → exponential backoff retry up to 3x
-   *  - post-only rejection → re-price 1 tick further from market, up to 2x
-   *  - permanent (insufficient/min_notional/etc) → mark with category-specific status
+   *  - permanent → mark with category-specific status; the 1-minute integrity
+   *    loop will retry at the SAME spec price (we NEVER mutate grid levels —
+   *    if a price can't be placed now, wait for the market to drift away)
    *  - fatal (auth) → throw to abort the bot
    *
    * All errors are surfaced both on `order.lastError` (for inspection) and as
@@ -252,7 +260,6 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
   private async _placeOrderAttempt(
     ctx: StrategyContext,
     order: SimpleOrder,
-    repriceAttempts = 0,
     transientAttempts = 0,
   ): Promise<void> {
     const cid = `orca-${this.tag(ctx)}-${order.side === 'BUY' ? 'b' : 's'}-${randomUUID().slice(0, 6)}`;
@@ -293,34 +300,15 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
           attempt: transientAttempts + 1, errCategory: c.category, msg: c.msg,
         });
         await new Promise((r) => setTimeout(r, backoffMs));
-        await this._placeOrderAttempt(ctx, order, repriceAttempts, transientAttempts + 1);
+        await this._placeOrderAttempt(ctx, order, transientAttempts + 1);
         return;
       }
 
-      // Post-only rejection — try re-pricing 1 tick further from market (up to 2 attempts).
-      if (c.category === 'POST_ONLY_REJECTED' && repriceAttempts < 2) {
-        const tick = new Decimal(ctx.filters.tickSize);
-        const adj = order.side === 'BUY'
-          ? new Decimal(order.price).minus(tick)
-          : new Decimal(order.price).plus(tick);
-        if (adj.lte(0)) {
-          order.status = 'post_only_rejected';
-          order.lastError = { code: c.code, category: c.category, msg: c.msg, ts: Date.now() };
-          return;
-        }
-        const newPrice = roundToTickSize(adj, ctx.filters.tickSize);
-        ctx.logger.info('Post-only rejection — re-pricing 1 tick away', {
-          side: order.side, oldPrice: order.price, newPrice, attempt: repriceAttempts + 1,
-        });
-        order.price = newPrice;
-        await this._placeOrderAttempt(ctx, order, repriceAttempts + 1, transientAttempts);
-        return;
-      }
-
-      // Permanent / will-be-retried-by-reconcile — mark status & store error.
+      // Permanent for now — mark with status & store error. The 1-minute
+      // integrity loop will retry at the SAME spec price (no mutation).
       order.status = statusForCategory(c.category);
       order.lastError = { code: c.code, category: c.category, msg: c.msg, ts: Date.now() };
-      ctx.logger.warn('Order placement failed', {
+      ctx.logger.warn('Order placement failed (will retry next minute)', {
         side: order.side, price: order.price, errCategory: c.category,
         code: c.code, msg: c.msg, hint: c.hint,
       });
@@ -332,9 +320,10 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
           side: order.side, price: order.price, quantity: order.quantity,
           attemptedClientOrderId: cid,
           errCategory: c.category, code: c.code, msg: c.msg, hint: c.hint,
-          attempts: { reprice: repriceAttempts, transient: transientAttempts },
+          transientAttempts,
           status: order.status,
-          willRetry: order.status === 'ignored_balance' || order.status === 'post_only_rejected' || order.status === 'price_too_far',
+          // We always retry — only AUTH errors are fatal, and those throw above.
+          willRetry: true,
         });
     }
   }
@@ -625,63 +614,45 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
   }
 
   /**
-   * Periodic safety net:
-   *   1. Retry any orders skipped due to insufficient balance.
-   *   2. Compare our internal `open` orders to Binance's reality:
-   *      - Missing on exchange & FILLED → synthesize fill event so PnL/counter happen.
-   *      - Missing & CANCELED/EXPIRED/REJECTED → re-place.
-   *      - Genuinely missing (-2013 unknown order) → re-place.
-   */
-  /**
-   * MUST be called inside withBotLock. Operates on the live state and saves
-   * once at the end. Routes any missed fills through `_handleFill` directly
-   * (no re-locking, no nested onOrderUpdate).
+   * 1-minute integrity loop. MUST be called inside withBotLock. The contract:
+   *
+   *   ┌─ For every order in state.orders that ISN'T currently open on Binance:
+   *   │   • If it's `open` in our state but missing on exchange → query its
+   *   │     final status. FILLED → process the fill (counter order placed).
+   *   │     CANCELED/EXPIRED/REJECTED/-2013 → re-place at SAME spec price.
+   *   │   • If our state already says it's failed (any non-open status) →
+   *   │     re-attempt at SAME spec price. We NEVER mutate the price; if
+   *   │     it can't be placed now, the next minute will try again.
+   *   └─ Always emit a `GRID_INTEGRITY` event with current vs expected counts.
+   *
+   * Outcome: the grid converges to "every level has an open order on Binance"
+   * eventually, automatically, without operator intervention.
    */
   private async _reconcileLocked(ctx: StrategyContext, params: GridSimpleParams): Promise<void> {
     const state = await ctx.loadState<GridSimpleState>();
     if (!state) return;
     if (!Array.isArray(state.processedFills)) state.processedFills = [];
 
-    // 1) Retry orders that previously failed for retryable reasons.
-    //    The market may have moved or balance may have freed up since.
-    const RETRY_STATUSES = ['ignored_balance', 'post_only_rejected', 'price_too_far'];
-    const retryable = state.orders.filter((o) => RETRY_STATUSES.includes(o.status));
-    if (retryable.length > 0) {
-      const byStatus: Record<string, number> = {};
-      for (const o of retryable) byStatus[o.status] = (byStatus[o.status] ?? 0) + 1;
-      ctx.logger.info(`Retrying ${retryable.length} skipped orders`, byStatus);
-      for (const o of retryable) {
-        o.status = 'pending';
-        delete o.lastError;
-      }
-      const CHUNK = 25;
-      for (let i = 0; i < retryable.length; i += CHUNK) {
-        await Promise.allSettled(retryable.slice(i, i + CHUNK).map((o) => this.placeOrder(ctx, o)));
-      }
-      const recovered = retryable.filter((o) => o.status === 'open').length;
-      const stillBad = retryable.length - recovered;
-      await ctx.emit('GRID_RECONCILE_RETRY',
-        `Reconcile retry: ${recovered}/${retryable.length} recovered (${stillBad} still skipped)`,
-        { recovered, stillBad, total: retryable.length });
-      if (stillBad > 0) await this.summarizeAndEmit(ctx, retryable, 'reconcile');
-    }
+    const t0 = Date.now();
 
-    // 2) Reconcile vs exchange
-    let exchangeOpen: { orderId: number; clientOrderId: string }[] = [];
+    // ─── Snapshot exchange's open orders for this bot ───
+    let exchangeOpen: Array<{ orderId: number; clientOrderId: string }> = [];
     try {
       const open = await ctx.client.getOpenOrders(ctx.symbol);
       exchangeOpen = open.map((o) => ({ orderId: o.orderId, clientOrderId: o.clientOrderId }));
     } catch (err) {
-      ctx.logger.warn('reconcile: getOpenOrders failed', { err: String(err) });
+      ctx.logger.warn('integrity: getOpenOrders failed — skipping this cycle', { err: String(err) });
       await ctx.saveState(state);
       return;
     }
     const exOpenIds = new Set(exchangeOpen.map((o) => String(o.orderId)));
 
-    const ourOpen = state.orders.filter((o) => o.status === 'open' && o.orderId);
-    for (const internal of ourOpen) {
+    // ─── Pass 1: orders our state thinks are `open` but exchange doesn't show ───
+    // Resolve each by querying its final state, then either pick up missed
+    // fill OR re-place if cancelled/rejected/never-arrived.
+    const stateOpen = state.orders.filter((o) => o.status === 'open' && o.orderId);
+    for (const internal of stateOpen) {
       if (exOpenIds.has(String(internal.orderId))) continue;
-      // Order is in our state as "open" but exchange doesn't show it.
       type FinalOrder = {
         status: string; side: 'BUY' | 'SELL'; orderId: number;
         clientOrderId: string; executedQty: string; price: string;
@@ -693,22 +664,19 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
       } catch (e) {
         const code = (e as { response?: { data?: { code?: number } } }).response?.data?.code;
         if (code === -2013) {
-          // Order never made it onto the exchange — re-place.
+          // Order never reached the exchange — flip to pending so Pass 2 retries it.
           internal.status = 'pending';
           internal.orderId = undefined;
           internal.clientOrderId = undefined;
-          await this.placeOrder(ctx, internal);
           continue;
         }
-        ctx.logger.warn('reconcile: getOrder failed', { orderId: internal.orderId, err: String(e) });
+        ctx.logger.warn('integrity: getOrder failed', { orderId: internal.orderId, err: String(e) });
         continue;
       }
       if (!final) continue;
 
       if (final.status === 'FILLED') {
-        ctx.logger.info('reconcile: picking up missed fill', { orderId: final.orderId });
-        // Use _handleFill directly so we mutate the SAME state object
-        // and the single saveState at the end persists everything atomically.
+        ctx.logger.info('integrity: picking up missed fill', { orderId: final.orderId });
         await this._handleFill(ctx, params, state, {
           clientOrderId: final.clientOrderId,
           exchangeOrderId: final.orderId,
@@ -721,12 +689,59 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
           symbol: ctx.symbol,
         });
       } else if (['CANCELED', 'EXPIRED', 'REJECTED'].includes(final.status)) {
-        ctx.logger.warn('reconcile: re-placing order', { orderId: final.orderId, status: final.status });
+        ctx.logger.warn('integrity: order not viable, will retry', {
+          orderId: final.orderId, status: final.status,
+        });
         internal.status = 'pending';
         internal.orderId = undefined;
         internal.clientOrderId = undefined;
-        await this.placeOrder(ctx, internal);
       }
+    }
+
+    // ─── Pass 2: retry EVERY non-open order at its original spec price ───
+    // This includes ignored_balance, post_only_rejected, price_too_far,
+    // min_notional, bad_price, bad_qty, error, pending — anything not 'open'.
+    // We never mutate `order.price`; the level is sacred.
+    const toRetry = state.orders.filter((o) => o.status !== 'open');
+    let recovered = 0;
+    if (toRetry.length > 0) {
+      const byStatus: Record<string, number> = {};
+      for (const o of toRetry) byStatus[o.status] = (byStatus[o.status] ?? 0) + 1;
+      ctx.logger.info(`integrity: retrying ${toRetry.length} non-open orders`, byStatus);
+      for (const o of toRetry) {
+        o.status = 'pending';
+        delete o.lastError;
+        // Clear stale identifiers so a fresh clientOrderId is generated.
+        o.orderId = undefined;
+        o.clientOrderId = undefined;
+      }
+      const CHUNK = 25;
+      for (let i = 0; i < toRetry.length; i += CHUNK) {
+        await Promise.allSettled(toRetry.slice(i, i + CHUNK).map((o) => this.placeOrder(ctx, o)));
+      }
+      recovered = toRetry.filter((o) => o.status === 'open').length;
+    }
+
+    // ─── Final integrity report ───
+    const expected = state.orders.length;
+    const openNow = state.orders.filter((o) => o.status === 'open').length;
+    const failed = state.orders.filter((o) => o.status !== 'open');
+    const missing = expected - openNow;
+    const ms = Date.now() - t0;
+
+    if (missing === 0) {
+      ctx.logger.info(`integrity ✓ all ${expected} levels open (${ms}ms)`);
+      await ctx.emit('GRID_INTEGRITY_OK',
+        `All ${expected} grid levels are open on Binance`,
+        { expected, open: openNow, ms });
+    } else {
+      ctx.logger.warn(`integrity ✗ ${openNow}/${expected} open, ${missing} missing — will retry next minute`,
+        { recovered, missing, ms });
+      await ctx.emit('GRID_INTEGRITY_REPAIR',
+        `${openNow}/${expected} levels open. Recovered ${recovered}/${toRetry.length} this cycle. ${missing} still missing — will retry next minute.`,
+        { expected, open: openNow, missing, recovered, attemptedRetries: toRetry.length, ms });
+      // Surface the specific errors so the user sees WHY each level is still down.
+      if (failed.length > 0) await this.summarizeAndEmit(ctx, failed, 'reconcile');
     }
 
     await ctx.saveState(state);
