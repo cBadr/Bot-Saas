@@ -82,6 +82,24 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
     ctx: StrategyContext,
     order: SimpleOrder,
   ): Promise<void> {
+    return this._placeOrderAttempt(ctx, order, 0);
+  }
+
+  /**
+   * Try to place an order. Handles:
+   *  - Real insufficient balance → mark `ignored_balance`, reconcile retries.
+   *  - Post-only rejection ("would immediately match") → re-price 1 tick further
+   *    from the market and retry once; if still rejected, mark `post_only_rejected`
+   *    (NOT retried — the spread is too tight; user needs to widen).
+   *  - Filter failure → one 3s retry with same params.
+   *  - Auth error → fatal throw.
+   *  - Other → mark `error`.
+   */
+  private async _placeOrderAttempt(
+    ctx: StrategyContext,
+    order: SimpleOrder,
+    repriceAttempts: number,
+  ): Promise<void> {
     const cid = `orca-${this.tag(ctx)}-${order.side === 'BUY' ? 'b' : 's'}-${randomUUID().slice(0, 6)}`;
     try {
       const res = await ctx.client.placeOrder({
@@ -105,15 +123,59 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
       const code = e.response?.data?.code;
       const msg = e.response?.data?.msg ?? e.message ?? String(err);
 
-      // Fatal — auth error. Surface and bubble up.
+      // Fatal — auth error.
       if (code === -2014 || code === -2015) {
         ctx.logger.error('Fatal API key error — bot must stop', { code, msg });
         await ctx.emit('FATAL_API_ERROR', `Fatal: ${msg}`, { code });
         throw err;
       }
 
-      // Insufficient balance — non-fatal. Mark and let reconcile retry it.
-      if (code === -2010 || /insufficient balance/i.test(msg)) {
+      // Distinguish post-only rejection from insufficient balance —
+      // both can return -2010, but the message tells them apart.
+      const wouldMatch =
+        /immediately match/i.test(msg) ||
+        /post[- ]?only/i.test(msg) ||
+        code === -2011 ||
+        msg.includes('Order would trigger immediately');
+      const realInsufficient =
+        !wouldMatch && (/insufficient balance/i.test(msg) || code === -2010);
+
+      if (wouldMatch) {
+        // Re-price one tick further from the market and retry once.
+        if (repriceAttempts < 2) {
+          const tick = new Decimal(ctx.filters.tickSize);
+          const adj = order.side === 'BUY'
+            ? new Decimal(order.price).minus(tick)
+            : new Decimal(order.price).plus(tick);
+          if (adj.lte(0)) {
+            order.status = 'post_only_rejected';
+            order.lastError = { code, msg, ts: Date.now() };
+            return;
+          }
+          const newPrice = roundToTickSize(adj, ctx.filters.tickSize);
+          ctx.logger.info('Post-only rejection — re-pricing 1 tick away', {
+            side: order.side, oldPrice: order.price, newPrice, attempt: repriceAttempts + 1,
+          });
+          // Recompute qty so quote spend stays close to orderSize. Use the original
+          // order.quantity * (oldPrice / newPrice) ratio? Simpler: re-use same qty.
+          order.price = newPrice;
+          await this._placeOrderAttempt(ctx, order, repriceAttempts + 1);
+          return;
+        }
+        // Two re-prices failed → spread is too tight relative to current book.
+        ctx.logger.warn('Order skipped: too close to market for LIMIT_MAKER', {
+          side: order.side, price: order.price, msg,
+        });
+        order.status = 'post_only_rejected';
+        order.lastError = { code, msg, ts: Date.now() };
+        await ctx.emit('ORDER_SKIPPED_POST_ONLY',
+          `${order.side} @ ${order.price} skipped — too close to market. Widen gridSpread.`,
+          { side: order.side, price: order.price });
+        return;
+      }
+
+      if (realInsufficient) {
+        // Real lack of balance — reconcile loop retries with same price/qty.
         order.status = 'ignored_balance';
         order.lastError = { code, msg, ts: Date.now() };
         return;
@@ -402,17 +464,23 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
     if (!state) return;
     if (!Array.isArray(state.processedFills)) state.processedFills = [];
 
-    // 1) Retry balance-skipped
-    const skipped = state.orders.filter((o) => o.status === 'ignored_balance');
-    if (skipped.length > 0) {
-      ctx.logger.info(`Retrying ${skipped.length} balance-skipped orders`);
-      for (const o of skipped) {
+    // 1) Retry balance-skipped AND post-only-rejected orders.
+    //    The market may have moved away from these prices, freeing them up.
+    const retryable = state.orders.filter(
+      (o) => o.status === 'ignored_balance' || o.status === 'post_only_rejected',
+    );
+    if (retryable.length > 0) {
+      ctx.logger.info(`Retrying ${retryable.length} skipped orders`, {
+        balance: retryable.filter((o) => o.status === 'ignored_balance').length,
+        postOnly: retryable.filter((o) => o.status === 'post_only_rejected').length,
+      });
+      for (const o of retryable) {
         o.status = 'pending';
         delete o.lastError;
       }
       const CHUNK = 20;
-      for (let i = 0; i < skipped.length; i += CHUNK) {
-        await Promise.allSettled(skipped.slice(i, i + CHUNK).map((o) => this.placeOrder(ctx, o)));
+      for (let i = 0; i < retryable.length; i += CHUNK) {
+        await Promise.allSettled(retryable.slice(i, i + CHUNK).map((o) => this.placeOrder(ctx, o)));
       }
     }
 
