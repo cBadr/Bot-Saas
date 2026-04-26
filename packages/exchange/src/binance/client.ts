@@ -126,6 +126,47 @@ export class BinanceClient {
     return this.signedDelete(BINANCE_ENDPOINTS.OPEN_ORDERS, { symbol });
   }
 
+  /**
+   * Place many orders in parallel with bounded concurrency.
+   *
+   * NOTE: Binance Spot API has NO native batch order endpoint
+   * (only Futures does, via /fapi/v1/batchOrders). The best Spot
+   * can do is parallel HTTP requests, capped to the rate limit
+   * (default: 50 orders / 10s / symbol).
+   *
+   * Returns one result per input order, in the same order.
+   */
+  async batchPlaceOrders(
+    orders: PlaceOrderParams[],
+    opts: { concurrency?: number } = {},
+  ): Promise<BatchResult<BinanceOrderResponse>[]> {
+    return runWithConcurrency(
+      orders,
+      (o) => this.placeOrder(o),
+      opts.concurrency ?? 20,
+    );
+  }
+
+  /**
+   * Cancel many orders in parallel with bounded concurrency.
+   *
+   * Same caveat: there is no batch cancel on Spot. We deliberately do
+   * NOT use DELETE /api/v3/openOrders because that cancels EVERYTHING
+   * on the symbol — including other bots' orders and manual trades.
+   * Bot-scoped cancellation must address each clientOrderId individually.
+   */
+  async batchCancelOrders(
+    symbol: string,
+    clientOrderIds: string[],
+    opts: { concurrency?: number } = {},
+  ): Promise<BatchResult<BinanceOrderResponse>[]> {
+    return runWithConcurrency(
+      clientOrderIds,
+      (cid) => this.cancelOrder({ symbol, origClientOrderId: cid }),
+      opts.concurrency ?? 20,
+    );
+  }
+
   async getOrder(params: {
     symbol: string;
     orderId?: number;
@@ -299,4 +340,41 @@ export function createBinanceClient(
 
 export function createPublicBinanceClient(): BinanceClient {
   return new BinanceClient({ enforceLimitOnly: false });
+}
+
+// ─── Batch-helper plumbing ──────────────────────────────────
+
+export type BatchResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: unknown };
+
+/**
+ * Run an async fn over an input list with a hard concurrency cap.
+ * Preserves input order in the output.
+ */
+async function runWithConcurrency<I, O>(
+  items: I[],
+  fn: (item: I, index: number) => Promise<O>,
+  concurrency: number,
+): Promise<BatchResult<O>[]> {
+  const results: BatchResult<O>[] = new Array(items.length);
+  let cursor = 0;
+  const workers: Promise<void>[] = [];
+  const n = Math.max(1, Math.min(concurrency, items.length));
+  for (let w = 0; w < n; w++) {
+    workers.push((async () => {
+      while (true) {
+        const i = cursor++;
+        if (i >= items.length) return;
+        try {
+          const value = await fn(items[i]!, i);
+          results[i] = { ok: true, value };
+        } catch (error) {
+          results[i] = { ok: false, error };
+        }
+      }
+    })());
+  }
+  await Promise.all(workers);
+  return results;
 }

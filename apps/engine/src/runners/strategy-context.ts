@@ -42,7 +42,11 @@ export function buildStrategyContext(args: BuildContextArgs): StrategyContext {
 
     /**
      * Cancel ONLY orders this bot placed (tracked in DB), not all symbol orders.
-     * Returns the number cancelled.
+     * Uses batchCancelOrders (parallel HTTP, concurrency=20) so even a 100-order
+     * grid takes <1s instead of >30s sequential.
+     *
+     * NOTE: Spot has no native batch cancel + we deliberately do NOT use
+     * DELETE /api/v3/openOrders (which would also kill manual trades / other bots).
      */
     async cancelMyOrders(): Promise<number> {
       const open = await prisma.order.findMany({
@@ -52,19 +56,46 @@ export function buildStrategyContext(args: BuildContextArgs): StrategyContext {
         },
         select: { clientOrderId: true, symbol: true },
       });
-      let cancelled = 0;
+      if (open.length === 0) return 0;
+
+      // Group by symbol (typically just one).
+      const bySymbol = new Map<string, string[]>();
       for (const o of open) {
-        try {
-          await client.cancelOrder({ symbol: o.symbol, origClientOrderId: o.clientOrderId });
-          cancelled++;
-        } catch (err) {
-          // Order might already be gone (filled/cancelled out-of-band)
-          logger.debug('cancelOrder failed (may already be gone)', {
-            clientOrderId: o.clientOrderId,
-            err: err instanceof Error ? err.message : String(err),
-          });
+        const arr = bySymbol.get(o.symbol) ?? [];
+        arr.push(o.clientOrderId);
+        bySymbol.set(o.symbol, arr);
+      }
+
+      const t0 = Date.now();
+      let cancelled = 0;
+      let alreadyGone = 0;
+      let failed = 0;
+      for (const [symbol, cids] of bySymbol) {
+        const results = await client.batchCancelOrders(symbol, cids, { concurrency: 20 });
+        for (let i = 0; i < results.length; i++) {
+          const r = results[i]!;
+          if (r.ok) {
+            cancelled++;
+          } else {
+            // -2011 "Unknown order sent" = order was already filled/cancelled.
+            // -2013 = same. Either way, not a real failure for our purposes.
+            const err = r.error as { response?: { data?: { code?: number } } };
+            const code = err.response?.data?.code;
+            if (code === -2011 || code === -2013) {
+              alreadyGone++;
+            } else {
+              failed++;
+              logger.warn('Cancel failed', {
+                clientOrderId: cids[i],
+                err: r.error instanceof Error ? r.error.message : String(r.error),
+              });
+            }
+          }
         }
       }
+      logger.info('Bot orders cancellation summary', {
+        total: open.length, cancelled, alreadyGone, failed, ms: Date.now() - t0,
+      });
       return cancelled;
     },
 

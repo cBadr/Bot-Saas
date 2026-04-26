@@ -321,8 +321,21 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
       order.status = statusForCategory(c.category);
       order.lastError = { code: c.code, category: c.category, msg: c.msg, ts: Date.now() };
       ctx.logger.warn('Order placement failed', {
-        side: order.side, price: order.price, errCategory: c.category, code: c.code, msg: c.msg, hint: c.hint,
+        side: order.side, price: order.price, errCategory: c.category,
+        code: c.code, msg: c.msg, hint: c.hint,
       });
+      // Per-order detailed event so the user can drill into each individual
+      // failure in the bot's activity log (separate from the aggregate summary).
+      void ctx.emit('ORDER_ERROR',
+        `${order.side} @ ${order.price} → ${c.category}${c.code ? ` (${c.code})` : ''}: ${c.msg.slice(0, 120)}`,
+        {
+          side: order.side, price: order.price, quantity: order.quantity,
+          attemptedClientOrderId: cid,
+          errCategory: c.category, code: c.code, msg: c.msg, hint: c.hint,
+          attempts: { reprice: repriceAttempts, transient: transientAttempts },
+          status: order.status,
+          willRetry: order.status === 'ignored_balance' || order.status === 'post_only_rejected' || order.status === 'price_too_far',
+        });
     }
   }
 
@@ -425,8 +438,12 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
       `Built symmetric ladder: ${orders.length} orders, spread=$${params.gridSpread}, start=${startPrice}`,
       { startPrice, gridLevels: params.gridLevels, spread: params.gridSpread, totalOrders: orders.length });
 
-    // ─── Fire all orders in parallel (chunked to respect Binance burst limits) ───
-    const CHUNK_SIZE = 20;
+    // ─── Fire all orders in parallel ───
+    // Spot has no native batch order endpoint (only Futures does). Best we can
+    // do is concurrent HTTP. Concurrency capped at 25 to stay well under
+    // Binance's default 50 orders/10s/symbol limit while leaving headroom for
+    // counter orders + reconcile activity.
+    const CHUNK_SIZE = 25;
     const t0 = Date.now();
     for (let i = 0; i < orders.length; i += CHUNK_SIZE) {
       const chunk = orders.slice(i, i + CHUNK_SIZE);
@@ -637,7 +654,7 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
         o.status = 'pending';
         delete o.lastError;
       }
-      const CHUNK = 20;
+      const CHUNK = 25;
       for (let i = 0; i < retryable.length; i += CHUNK) {
         await Promise.allSettled(retryable.slice(i, i + CHUNK).map((o) => this.placeOrder(ctx, o)));
       }
