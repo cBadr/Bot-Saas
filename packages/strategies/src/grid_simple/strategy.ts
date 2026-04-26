@@ -378,7 +378,9 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
       await ctx.emit('GRID_RESUMED',
         `Resumed grid with ${existing.orders.length} orders @ start ${existing.initialStartPrice}`);
       // Run a reconcile shortly after resume to catch missed fills.
-      existing.nextReconcileAtMs = Date.now() + 15_000;
+      // Run integrity ASAP on resume — engine's onTick fires every 5s,
+      // so the first integrity check kicks in within seconds of resume.
+      existing.nextReconcileAtMs = Date.now();
       await ctx.saveState(existing);
       return;
     }
@@ -457,7 +459,11 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
       orders,
       unmatchedBuys: [],
       startedAtMs: Date.now(),
-      nextReconcileAtMs: Date.now() + RECONCILE_EVERY_MS,
+      // Schedule first integrity loop for the very next tick (~5s) — instead
+      // of waiting a full minute. This picks up any orders that failed during
+      // initial placement (post-only rejections, balance shortfalls, etc.)
+      // and retries them immediately rather than leaving the grid incomplete.
+      nextReconcileAtMs: Date.now(),
       autoStopped: false,
       processedFills: [],
     };
