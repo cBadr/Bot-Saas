@@ -147,6 +147,41 @@ export const useBotOrders = (id: string) =>
     refetchInterval: 30_000,
   });
 
+export interface BotLive {
+  botId: string;
+  symbol: string;
+  strategyKey: string | null;
+  initialStartPrice: string | null;
+  marketPrice: string | null;
+  orders: Array<{
+    side: 'BUY' | 'SELL'; price: string; quantity: string; status: string;
+    orderId: number | null; clientOrderId: string | null;
+    errorCategory: string | null; errorMsg: string | null; errorCode: number | null;
+  }>;
+  integrity: {
+    total: number; open: number; failed: number;
+    breakdown: Record<string, number>;
+    startedAtMs: number | null;
+    nextReconcileAtMs: number | null;
+    latestEvent: { type: string; message: string; createdAt: string } | null;
+  };
+  pnl: {
+    cumulative: number;
+    cyclesCompleted: number;
+    avgPerCycle: number;
+    series: Array<{ ts: number; pnl: number }>;
+    unmatchedBuys: number;
+  };
+}
+
+export const useBotLive = (id: string) =>
+  useQuery({
+    queryKey: ['bot-live', id],
+    queryFn: () => apiCall<BotLive>(() => api.get(`/bots/${id}/live`)),
+    enabled: !!tokenStore.access && !!id,
+    refetchInterval: 5_000,
+  });
+
 export const useCreateBot = () => {
   const qc = useQueryClient();
   return useMutation({

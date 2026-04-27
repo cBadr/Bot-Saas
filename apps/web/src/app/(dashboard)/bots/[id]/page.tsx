@@ -1,11 +1,14 @@
 'use client';
 import { useParams, useRouter } from 'next/navigation';
-import { useBot, useBotEvents, useBotOrders, useRecomputeBotStats, useStartBot, useStopBot } from '@/lib/queries';
+import { useBot, useBotEvents, useBotLive, useBotOrders, useRecomputeBotStats, useStartBot, useStopBot } from '@/lib/queries';
 import { useBotRealtime } from '@/lib/realtime';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { StatusBadge } from '@/components/status-badge';
+import { LiveTradingChart } from '@/components/live-trading-chart';
+import { IntegrityWidget } from '@/components/integrity-widget';
+import { PnLSparkline } from '@/components/pnl-sparkline';
 import { formatNumber, formatRelativeTime } from '@/lib/utils';
 import { ArrowLeft, RefreshCw } from 'lucide-react';
 import { toast } from 'sonner';
@@ -17,6 +20,7 @@ export default function BotDetailPage() {
   const { data: bot } = useBot(id);
   const { data: events } = useBotEvents(id);
   const { data: orders } = useBotOrders(id);
+  const { data: live } = useBotLive(id);
   const start = useStartBot();
   const stop = useStopBot();
   const recompute = useRecomputeBotStats();
@@ -54,6 +58,17 @@ export default function BotDetailPage() {
         <Stat label="Volume" value="—" />
         <Stat label="Started" value={bot.startedAt ? formatRelativeTime(bot.startedAt) : '—'} />
       </div>
+
+      {/* ─── Live monitoring (only meaningful for grid-style strategies with state) ─── */}
+      {live && live.integrity.total > 0 && (
+        <>
+          <LiveTradingChart live={live} />
+          <div className="grid gap-6 lg:grid-cols-2">
+            <IntegrityWidget live={live} />
+            <PnLSparkline live={live} />
+          </div>
+        </>
+      )}
 
       <div className="grid gap-6 lg:grid-cols-2">
         <Card>

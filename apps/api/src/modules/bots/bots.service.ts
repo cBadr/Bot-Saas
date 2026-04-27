@@ -67,6 +67,110 @@ export class BotsService {
     });
   }
 
+  /**
+   * Live monitoring snapshot for the bot detail page:
+   *   - current grid orders (from strategy state.orders, with status)
+   *   - integrity summary (open / failed / total)
+   *   - latest GRID_INTEGRITY event + when next is due
+   *   - cycle stats + recent realized PnL series for the sparkline
+   *
+   * Designed to be polled at 5-10s intervals from the UI.
+   */
+  async live(userId: string, id: string) {
+    const bot = await this.findOwned(userId, id, {
+      strategy: { select: { builtinKey: true, name: true } },
+    }) as { id: string; symbol: string; state: unknown; strategy?: { builtinKey?: string | null } };
+
+    const state = (bot.state ?? {}) as {
+      initialStartPrice?: string;
+      orders?: Array<{
+        side: 'BUY' | 'SELL'; price: string; quantity: string; status: string;
+        clientOrderId?: string; orderId?: number;
+        lastError?: { code?: number; category?: string; msg?: string; ts: number };
+      }>;
+      unmatchedBuys?: Array<{ price: string; quantity: string }>;
+      startedAtMs?: number;
+      nextReconcileAtMs?: number;
+      processedFills?: string[];
+    };
+
+    const orders = state.orders ?? [];
+    const breakdown: Record<string, number> = {};
+    for (const o of orders) breakdown[o.status] = (breakdown[o.status] ?? 0) + 1;
+    const open = breakdown['open'] ?? 0;
+
+    // Latest integrity event
+    const integrityEvent = await this.prisma.botEvent.findFirst({
+      where: { botId: id, type: { in: ['GRID_INTEGRITY_OK', 'GRID_INTEGRITY_REPAIR'] } },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    // Recent trades for the PnL sparkline (last 100, oldest→newest)
+    const trades = await this.prisma.trade.findMany({
+      where: { botId: id, realizedPnl: { not: null } },
+      orderBy: { executedAt: 'asc' },
+      take: 100,
+      select: { realizedPnl: true, executedAt: true, side: true, price: true },
+    });
+
+    let cumulative = 0;
+    const pnlSeries = trades.map((t) => {
+      cumulative += Number(t.realizedPnl ?? 0);
+      return { ts: t.executedAt.getTime(), pnl: cumulative };
+    });
+
+    const cycles = trades.filter((t) => t.side === 'SELL').length;
+
+    // Live ticker for "where is the market vs our levels"
+    let marketPrice: string | null = null;
+    try {
+      const pub = createPublicBinanceClient();
+      const ticker = await pub.getTickerPrice(bot.symbol);
+      marketPrice = ticker.price;
+    } catch {
+      // Non-fatal — UI will still render without it.
+    }
+
+    return {
+      botId: bot.id,
+      symbol: bot.symbol,
+      strategyKey: bot.strategy?.builtinKey ?? null,
+      initialStartPrice: state.initialStartPrice ?? null,
+      marketPrice,
+      orders: orders.map((o) => ({
+        side: o.side,
+        price: o.price,
+        quantity: o.quantity,
+        status: o.status,
+        orderId: o.orderId ?? null,
+        clientOrderId: o.clientOrderId ?? null,
+        errorCategory: o.lastError?.category ?? null,
+        errorMsg: o.lastError?.msg ?? null,
+        errorCode: o.lastError?.code ?? null,
+      })),
+      integrity: {
+        total: orders.length,
+        open,
+        failed: orders.length - open,
+        breakdown,
+        startedAtMs: state.startedAtMs ?? null,
+        nextReconcileAtMs: state.nextReconcileAtMs ?? null,
+        latestEvent: integrityEvent ? {
+          type: integrityEvent.type,
+          message: integrityEvent.message,
+          createdAt: integrityEvent.createdAt,
+        } : null,
+      },
+      pnl: {
+        cumulative,
+        cyclesCompleted: cycles,
+        avgPerCycle: cycles > 0 ? cumulative / cycles : 0,
+        series: pnlSeries,
+        unmatchedBuys: state.unmatchedBuys?.length ?? 0,
+      },
+    };
+  }
+
   async create(userId: string, dto: CreateBotInput) {
     const [strategy, apiKey] = await Promise.all([
       this.prisma.strategy.findUnique({ where: { id: dto.strategyId } }),

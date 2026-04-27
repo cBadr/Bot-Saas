@@ -49,6 +49,11 @@ export class BotsController {
     return this.bots.orders(u.sub, id, limit ? Number(limit) : 100);
   }
 
+  @Get(':id/live')
+  live(@CurrentUser() u: CurrentUserPayload, @Param('id') id: string) {
+    return this.bots.live(u.sub, id);
+  }
+
   @Post()
   create(@CurrentUser() u: CurrentUserPayload, @Body(new ZodValidationPipe(CreateBotDto)) dto: CreateBotDto) {
     return this.bots.create(u.sub, dto);
