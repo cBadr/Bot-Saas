@@ -16,7 +16,8 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/com
 import { Badge } from '@/components/ui/badge';
 import type { BotLive } from '@/lib/queries';
 
-const INTERVAL = '5m';
+type Interval = '1m' | '5m' | '15m' | '1h';
+const INTERVALS: Interval[] = ['1m', '5m', '15m', '1h'];
 const KLINE_LIMIT = 200;
 
 interface KlineMsg {
@@ -42,8 +43,15 @@ export function LiveTradingChart({ live }: { live: BotLive }) {
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const priceLinesRef = useRef<Map<string, IPriceLine>>(new Map());
   const wsRef = useRef<WebSocket | null>(null);
+  /**
+   * Custom price-range provider: forces the visible y-range to span from
+   * the lowest open BUY to the highest open SELL so the grid is always
+   * neatly framed. Updated on every order change via this ref.
+   */
+  const priceRangeRef = useRef<{ min: number; max: number } | null>(null);
   const [ready, setReady] = useState(false);
   const [wsConnected, setWsConnected] = useState(false);
+  const [tf, setTf] = useState<Interval>('5m');
 
   // ─── Init chart once ───
   useEffect(() => {
@@ -85,6 +93,17 @@ export function LiveTradingChart({ live }: { live: BotLive }) {
       borderDownColor: '#dc2626',
       wickUpColor: '#16a34a',
       wickDownColor: '#dc2626',
+      // Force the visible y-range to frame the grid (lowest BUY → highest SELL).
+      // The provider is read by the chart on every render, so updating
+      // priceRangeRef.current is enough to re-frame.
+      autoscaleInfoProvider: (originalProvider: () => unknown) => {
+        const r = priceRangeRef.current;
+        if (!r) return originalProvider() as never;
+        return {
+          priceRange: { minValue: r.min, maxValue: r.max },
+          margins: { above: 16, below: 16 },
+        };
+      },
     });
 
     chartRef.current = chart;
@@ -107,8 +126,9 @@ export function LiveTradingChart({ live }: { live: BotLive }) {
 
     (async () => {
       try {
+        setReady(false);
         const res = await fetch(
-          `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${INTERVAL}&limit=${KLINE_LIMIT}`,
+          `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${tf}&limit=${KLINE_LIMIT}`,
         );
         const raw = (await res.json()) as Array<[number, string, string, string, string, string]>;
         if (cancelled || !seriesRef.current) return;
@@ -129,7 +149,7 @@ export function LiveTradingChart({ live }: { live: BotLive }) {
 
     // Live WS feed
     const ws = new WebSocket(
-      `wss://stream.binance.com:9443/ws/${symbol.toLowerCase()}@kline_${INTERVAL}`,
+      `wss://stream.binance.com:9443/ws/${symbol.toLowerCase()}@kline_${tf}`,
     );
     wsRef.current = ws;
     ws.onopen = () => setWsConnected(true);
@@ -154,7 +174,7 @@ export function LiveTradingChart({ live }: { live: BotLive }) {
       ws.close();
       wsRef.current = null;
     };
-  }, [live.symbol]);
+  }, [live.symbol, tf]);
 
   // ─── Sync price lines (orders + anchor) on every live update ───
   useEffect(() => {
@@ -176,29 +196,27 @@ export function LiveTradingChart({ live }: { live: BotLive }) {
       const baseColor = isOpen
         ? (isBuy ? '#22c55e' : '#ef4444')
         : '#eab308'; // yellow for pending repair
-      const title = isOpen
-        ? `${o.side} ${trimNum(o.quantity)}`
-        : `${o.side} · ${o.status}`;
       desired.set(key, {
         price: Number(o.price),
         color: baseColor,
         lineWidth: isOpen ? 2 : 1,
         lineStyle: isOpen ? LineStyle.Dashed : LineStyle.Dotted,
-        title,
+        // Empty title → no on-chart label clutter. Right-axis tag still shows the price.
+        title: '',
         axisLabelVisible: true,
         axisLabelColor: baseColor,
         axisLabelTextColor: '#ffffff',
       });
     }
 
-    // Anchor line
+    // Anchor line — also unlabeled on-chart, just an axis tag.
     if (live.initialStartPrice) {
       desired.set('__anchor__', {
         price: Number(live.initialStartPrice),
         color: '#a78bfa',
         lineWidth: 2,
         lineStyle: LineStyle.LargeDashed,
-        title: `⚓ ANCHOR ${trimNum(live.initialStartPrice)}`,
+        title: '',
         axisLabelVisible: true,
         axisLabelColor: '#a78bfa',
         axisLabelTextColor: '#ffffff',
@@ -223,6 +241,31 @@ export function LiveTradingChart({ live }: { live: BotLive }) {
         existing.set(key, line);
       }
     }
+
+    // ─── Auto-fit y-range: lowest open BUY → highest open SELL ───
+    // Per spec: bottom of chart = last/lowest BUY, top = last/highest SELL.
+    // We use min of all open BUYs and max of all open SELLs so the entire
+    // active grid is always framed.
+    const openBuys = live.orders.filter((o) => o.side === 'BUY' && o.status === 'open');
+    const openSells = live.orders.filter((o) => o.side === 'SELL' && o.status === 'open');
+    if (openBuys.length > 0 && openSells.length > 0) {
+      const lowestBuy = Math.min(...openBuys.map((o) => Number(o.price)));
+      const highestSell = Math.max(...openSells.map((o) => Number(o.price)));
+      priceRangeRef.current = { min: lowestBuy, max: highestSell };
+    } else if (openBuys.length > 0) {
+      const lowestBuy = Math.min(...openBuys.map((o) => Number(o.price)));
+      const highestBuy = Math.max(...openBuys.map((o) => Number(o.price)));
+      priceRangeRef.current = { min: lowestBuy, max: highestBuy };
+    } else if (openSells.length > 0) {
+      const lowestSell = Math.min(...openSells.map((o) => Number(o.price)));
+      const highestSell = Math.max(...openSells.map((o) => Number(o.price)));
+      priceRangeRef.current = { min: lowestSell, max: highestSell };
+    } else {
+      priceRangeRef.current = null;
+    }
+    // Trigger a price-scale recompute so autoscaleInfoProvider runs again.
+    // applyOptions on the price scale forces a redraw.
+    chartRef.current?.priceScale('right').applyOptions({});
   }, [live.orders, live.initialStartPrice, ready]);
 
   const buyOpen = live.orders.filter((o) => o.side === 'BUY' && o.status === 'open').length;
@@ -260,12 +303,28 @@ export function LiveTradingChart({ live }: { live: BotLive }) {
                 {failed} pending repair
               </Badge>
             )}
-            <Badge variant="outline" className="font-mono text-[10px]">{INTERVAL}</Badge>
+            {/* Timeframe selector */}
+            <div className="inline-flex items-center rounded-md border bg-muted/30 p-0.5 ml-1">
+              {INTERVALS.map((iv) => (
+                <button
+                  key={iv}
+                  type="button"
+                  onClick={() => setTf(iv)}
+                  className={`text-[10px] font-mono px-2 py-0.5 rounded transition-colors ${
+                    tf === iv
+                      ? 'bg-primary text-primary-foreground shadow-sm'
+                      : 'text-muted-foreground hover:text-foreground'
+                  }`}
+                >
+                  {iv}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
         <CardDescription className="text-xs">
-          {KLINE_LIMIT} × {INTERVAL} candles. Grid orders overlaid as price lines —
-          solid for open, dotted for pending repair. Anchor marked in purple.
+          {KLINE_LIMIT} × {tf} candles · auto-framed to current grid range.
+          Open orders dashed, pending-repair dotted, anchor in purple.
         </CardDescription>
       </CardHeader>
       <CardContent className="p-3">
@@ -305,8 +364,3 @@ export function LiveTradingChart({ live }: { live: BotLive }) {
   );
 }
 
-function trimNum(s: string): string {
-  const n = Number(s);
-  if (!Number.isFinite(n)) return s;
-  return n.toLocaleString(undefined, { maximumFractionDigits: 6 });
-}

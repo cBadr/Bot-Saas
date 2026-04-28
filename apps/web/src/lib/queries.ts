@@ -101,14 +101,32 @@ export const useDeleteExchangeKey = () => {
 };
 
 // ─── Bots ───
+export interface BotLiveStats {
+  gridLevels: number | null;
+  gridSpread: number | null;
+  orderSize: number | null;
+  totalInvestment: number | null;
+  expectedPerCycle: number | null;
+  cyclesCompleted: number;
+  realized: number;
+  unrealized: number;
+  total: number;
+  heldQty: number;
+  startPrice: number | null;
+}
+
 export interface Bot {
   id: string; name: string; symbol: string; status: string;
   baseAsset: string; quoteAsset: string;
   paperTrading?: boolean;
   totalTrades: number; realizedPnlQuote: string;
   startedAt: string | null; createdAt: string;
+  params?: Record<string, unknown>;
   strategy?: { id: string; name: string; type: string };
   apiKey?: { id: string; label: string; status: string };
+  /** Server-derived live stats (only present on list/detail responses). */
+  liveStats?: BotLiveStats;
+  marketPrice?: string | null;
 }
 
 export const useBots = () =>
@@ -180,6 +198,11 @@ export interface BotLive {
     /** Sold base inventory from SELL-first cycles still open. */
     soldQty: number;
     unmatchedCount: number;
+  };
+  volume: {
+    /** Total notional traded in quote (FDUSD). Σ trade.quoteQuantity. */
+    totalQuote: number;
+    tradeCount: number;
   };
 }
 

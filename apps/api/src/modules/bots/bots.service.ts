@@ -30,8 +30,8 @@ export class BotsService {
     private readonly notifications: NotificationsService,
   ) {}
 
-  list(userId: string) {
-    return this.prisma.bot.findMany({
+  async list(userId: string) {
+    const bots = await this.prisma.bot.findMany({
       where: { userId },
       include: {
         strategy: { select: { id: true, name: true, type: true, builtinKey: true } },
@@ -39,6 +39,99 @@ export class BotsService {
       },
       orderBy: { createdAt: 'desc' },
     });
+
+    // ─── Enrich each bot with derived live stats (cycles, realized,
+    //     unrealized, total profits, grid params summary) so the list
+    //     page can render rich rows without N round-trips. ──────────
+    //
+    // We bulk-fetch ALL ticker prices in one Binance call so per-bot
+    // unrealized calculation costs nothing extra.
+    const symbols = [...new Set(bots.map((b) => b.symbol))];
+    const priceMap = await this.bulkTickerPrices(symbols);
+
+    return bots.map((b) => {
+      const state = (b.state ?? {}) as {
+        initialStartPrice?: string;
+        unmatched?: Array<{ side: 'BUY' | 'SELL'; price: string; quantity: string }>;
+        unmatchedBuys?: Array<{ price: string; quantity: string }>;
+        realizedPnlQuote?: string;
+        cyclesCompleted?: number;
+      };
+      const params = (b.params ?? {}) as Record<string, unknown>;
+
+      // Held base inventory (BUY-side unmatched only — per spec, used for unrealized)
+      const unmatched = state.unmatched
+        ?? (state.unmatchedBuys?.map((u) => ({ side: 'BUY' as const, price: u.price, quantity: u.quantity })) ?? []);
+      const heldQty = unmatched
+        .filter((u) => u.side === 'BUY')
+        .reduce((s, u) => s + Number(u.quantity), 0);
+
+      const startNum = Number(state.initialStartPrice ?? 0);
+      const marketNum = Number(priceMap.get(b.symbol) ?? 0);
+      const realized = Number(state.realizedPnlQuote ?? 0);
+      const unrealized = (startNum > 0 && marketNum > 0 && heldQty > 0)
+        ? (marketNum - startNum) * heldQty
+        : 0;
+      const total = realized + unrealized;
+      const cycles = state.cyclesCompleted ?? 0;
+
+      // Grid Simple params readout (gracefully handles other strategies)
+      const gridLevels = num(params.gridLevels);
+      const gridSpread = num(params.gridSpread);
+      const orderSize = num(params.orderSize);
+      const totalInvestment = (gridLevels !== null && orderSize !== null)
+        // x2 model: 2 × N orders × orderSize, but only BUYs need quote upfront → N × orderSize
+        ? gridLevels * orderSize
+        : null;
+      // Expected profit per cycle = spread × (orderSize / startPrice)
+      const expectedPerCycle = (gridSpread !== null && orderSize !== null && startNum > 0)
+        ? gridSpread * (orderSize / startNum)
+        : null;
+
+      return {
+        ...b,
+        marketPrice: marketNum > 0 ? marketNum.toString() : null,
+        liveStats: {
+          gridLevels, gridSpread, orderSize, totalInvestment, expectedPerCycle,
+          cyclesCompleted: cycles,
+          realized,
+          unrealized,
+          total,
+          heldQty,
+          startPrice: startNum > 0 ? startNum : null,
+        },
+      };
+    });
+  }
+
+  /**
+   * Single Binance call to fetch all ticker prices, indexed by symbol.
+   * Returns an empty Map on any error (UI handles missing prices gracefully).
+   */
+  private async bulkTickerPrices(symbols: string[]): Promise<Map<string, string>> {
+    const map = new Map<string, string>();
+    if (symbols.length === 0) return map;
+    try {
+      const pub = createPublicBinanceClient();
+      // Fetch ALL prices in a single call — much cheaper than per-symbol.
+      const { request } = await import('undici');
+      const r = await request(`https://api.binance.com/api/v3/ticker/price`);
+      if (r.statusCode === 200) {
+        const data = (await r.body.json()) as Array<{ symbol: string; price: string }>;
+        for (const d of data) map.set(d.symbol, d.price);
+      } else {
+        // Fallback: one-by-one
+        for (const s of symbols) {
+          try {
+            const t = await pub.getTickerPrice(s);
+            map.set(s, t.price);
+          } catch { /* skip */ }
+        }
+      }
+    } catch (err) {
+      log.warn('bulkTickerPrices failed', { err: String(err) });
+    }
+    return map;
   }
 
   async get(userId: string, id: string) {
@@ -149,6 +242,14 @@ export class BotsService {
 
     const totalProfits = realized + unrealized;
 
+    // ─── Volume: total notional FDUSD traded by this bot ───
+    const volumeAgg = await this.prisma.trade.aggregate({
+      where: { botId: id },
+      _sum: { quoteQuantity: true },
+      _count: true,
+    });
+    const totalVolume = Number(volumeAgg._sum.quoteQuantity ?? 0);
+
     // Historical series for the sparkline — derived from BotEvents (BUY_FILLED /
     // SELL_FILLED carry cyclesCompleted + realizedPnlQuote snapshot in their data).
     const cycleEvents = await this.prisma.botEvent.findMany({
@@ -210,6 +311,10 @@ export class BotsService {
         heldQty,
         soldQty,
         unmatchedCount: unmatched.length,
+      },
+      volume: {
+        totalQuote: totalVolume,
+        tradeCount: volumeAgg._count,
       },
     };
   }
@@ -455,4 +560,11 @@ export class BotsService {
   private async publishCommand(cmd: EngineCommand) {
     await this.redis.publisher.publish(ENGINE_COMMAND_CHANNEL, JSON.stringify(cmd));
   }
+}
+
+/** Coerce an unknown JSON value to a finite number, or null. */
+function num(v: unknown): number | null {
+  if (v === null || v === undefined) return null;
+  const n = typeof v === 'number' ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
 }

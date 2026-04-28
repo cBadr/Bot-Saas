@@ -9,7 +9,8 @@ import { StatusBadge } from '@/components/status-badge';
 import { LiveTradingChart } from '@/components/live-trading-chart';
 import { IntegrityWidget } from '@/components/integrity-widget';
 import { PnLSparkline } from '@/components/pnl-sparkline';
-import { formatNumber, formatRelativeTime } from '@/lib/utils';
+import { BotInfoCard } from '@/components/bot-info-card';
+import { formatDuration, formatNumber, formatRelativeTime } from '@/lib/utils';
 import { ArrowLeft, RefreshCw } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -53,17 +54,39 @@ export default function BotDetailPage() {
       </div>
 
       <div className="grid gap-4 md:grid-cols-4">
-        <Stat label="Total Trades" value={String(bot.totalTrades ?? 0)} />
-        <Stat label="Realized P&L" value={formatNumber(bot.realizedPnlQuote)} sub={bot.quoteAsset} />
-        <Stat label="Volume" value="—" />
-        <Stat label="Started" value={bot.startedAt ? formatRelativeTime(bot.startedAt) : '—'} />
+        <Stat
+          label="Completed Cycles"
+          value={String(live?.pnl.cyclesCompleted ?? 0)}
+          sub={live && live.pnl.avgPerCycle > 0
+            ? `avg ${formatNumber(live.pnl.avgPerCycle, { maximumFractionDigits: 4 })} / cycle`
+            : undefined}
+        />
+        <Stat
+          label="Total Profits"
+          value={live ? formatNumber(live.pnl.total, { maximumFractionDigits: 4 }) : formatNumber(bot.realizedPnlQuote)}
+          sub={bot.quoteAsset}
+          tone={live && live.pnl.total !== 0 ? (live.pnl.total > 0 ? 'positive' : 'negative') : undefined}
+        />
+        <Stat
+          label="Volume"
+          value={live ? formatNumber(live.volume.totalQuote, { maximumFractionDigits: 2 }) : '—'}
+          sub={live && live.volume.tradeCount > 0
+            ? `${live.volume.tradeCount} trade${live.volume.tradeCount === 1 ? '' : 's'}`
+            : 'FDUSD'}
+        />
+        <Stat label="Started" value={bot.startedAt ? formatDuration(bot.startedAt) : '—'} />
       </div>
 
       {/* ─── Live monitoring (only meaningful for grid-style strategies with state) ─── */}
       {live && live.integrity.total > 0 && (
         <>
           <LiveTradingChart live={live} />
-          <div className="grid gap-6 lg:grid-cols-2">
+          <div className="grid gap-6 lg:grid-cols-3">
+            <BotInfoCard
+              live={live}
+              orderSizeQuote={extractOrderSize(bot)}
+              baseAsset={deriveBaseAsset(live.symbol, bot.quoteAsset)}
+            />
             <IntegrityWidget live={live} />
             <PnLSparkline live={live} />
           </div>
@@ -119,11 +142,30 @@ export default function BotDetailPage() {
   );
 }
 
-function Stat({ label, value, sub }: { label: string; value: string; sub?: string }) {
+function extractOrderSize(bot: { params?: unknown } | undefined): number | undefined {
+  const p = (bot?.params ?? {}) as Record<string, unknown>;
+  const v = p.orderSize ?? p.gsOrderSize;
+  return typeof v === 'number' ? v : Number(v) || undefined;
+}
+
+function deriveBaseAsset(symbol: string, quoteAsset?: string | null): string {
+  if (quoteAsset && symbol.endsWith(quoteAsset)) return symbol.slice(0, -quoteAsset.length);
+  for (const q of ['FDUSD', 'USDT', 'USDC', 'BUSD', 'BTC', 'ETH']) {
+    if (symbol.endsWith(q)) return symbol.slice(0, -q.length);
+  }
+  return symbol;
+}
+
+function Stat({
+  label, value, sub, tone,
+}: { label: string; value: string; sub?: string; tone?: 'positive' | 'negative' }) {
+  const toneClass = tone === 'positive' ? 'text-success'
+    : tone === 'negative' ? 'text-destructive'
+    : '';
   return (
     <Card><CardContent className="p-6">
       <div className="text-sm text-muted-foreground mb-1">{label}</div>
-      <div className="text-2xl font-bold">{value}</div>
+      <div className={`text-2xl font-bold tabular-nums ${toneClass}`}>{value}</div>
       {sub && <div className="text-xs text-muted-foreground mt-1">{sub}</div>}
     </CardContent></Card>
   );
