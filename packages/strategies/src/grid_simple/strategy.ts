@@ -18,18 +18,30 @@ interface SimpleOrder {
   lastError?: { code?: number; category?: string; msg?: string; ts: number };
 }
 
-interface UnmatchedBuy {
+/**
+ * A fill that has not yet been closed by its counter-side opposite.
+ *  - side='BUY'  → we hold base inventory waiting for a SELL above to close the cycle
+ *  - side='SELL' → we sold base inventory waiting for a BUY below to close the cycle
+ */
+interface UnmatchedFill {
+  side: 'BUY' | 'SELL';
   price: string;
   quantity: string;
 }
 
 interface GridSimpleState {
-  /** The price the ladder centers on. Captured ONCE at first init. */
+  /** The price the ladder centers on. Captured ONCE at first init.
+   *  Used as the REFERENCE price for Unrealized P&L per project spec. */
   initialStartPrice: string;
   /** Live order book maintained by the strategy. */
   orders: SimpleOrder[];
-  /** Filled BUYs awaiting their counter-SELL. Used for floating PnL / avg cost. */
-  unmatchedBuys: UnmatchedBuy[];
+  /** Fills awaiting their opposite-side closing leg. Either BUY or SELL. */
+  unmatched: UnmatchedFill[];
+  /** Cumulative realized P&L in quote (FDUSD). Sum of (spread × qty)
+   *  over all completed cycles. Updated atomically inside _handleFill. */
+  realizedPnlQuote: string;
+  /** Count of completed BUY↔SELL cycles. */
+  cyclesCompleted: number;
   /** Ms since epoch the bot first started — used for durationMinutes auto-stop. */
   startedAtMs: number;
   /** Next reconcile timestamp (ms). Strategy.onTick triggers reconcile when due. */
@@ -42,6 +54,10 @@ interface GridSimpleState {
    * OrderPoller, and reconcile (which all can observe the same event).
    */
   processedFills: string[];
+
+  // ── Legacy field kept for one-time migration from older state shape ──
+  /** @deprecated migrated into `unmatched` on load. Kept here for back-compat reads. */
+  unmatchedBuys?: Array<{ price: string; quantity: string }>;
 }
 
 /**
@@ -369,11 +385,14 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
   private async _initLocked(ctx: StrategyContext, params: GridSimpleParams): Promise<void> {
     const existing = await ctx.loadState<GridSimpleState>();
     if (existing) {
-      // Defensive: older saved states may lack processedFills.
-      if (!Array.isArray(existing.processedFills)) existing.processedFills = [];
+      // Defensive: older saved states may lack new fields. Migrate in-place.
+      this._migrateState(existing);
       ctx.logger.info('Resuming grid_simple from saved state', {
         orders: existing.orders.length,
         startPrice: existing.initialStartPrice,
+        unmatched: existing.unmatched.length,
+        realized: existing.realizedPnlQuote,
+        cycles: existing.cyclesCompleted,
       });
       await ctx.emit('GRID_RESUMED',
         `Resumed grid with ${existing.orders.length} orders @ start ${existing.initialStartPrice}`);
@@ -457,7 +476,9 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
     const state: GridSimpleState = {
       initialStartPrice: startPrice,
       orders,
-      unmatchedBuys: [],
+      unmatched: [],
+      realizedPnlQuote: '0',
+      cyclesCompleted: 0,
       startedAtMs: Date.now(),
       // Schedule first integrity loop for the very next tick (~5s) — instead
       // of waiting a full minute. This picks up any orders that failed during
@@ -468,6 +489,22 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
       processedFills: [],
     };
     await ctx.saveState(state);
+  }
+
+  /**
+   * Migrate older saved state shapes in-place so reads don't crash and
+   * counters don't reset to zero on the first save after deploy.
+   */
+  private _migrateState(s: GridSimpleState): void {
+    if (!Array.isArray(s.processedFills)) s.processedFills = [];
+    if (!Array.isArray(s.unmatched)) {
+      // Legacy: convert `unmatchedBuys` → `unmatched` with side='BUY'
+      const legacy = (s.unmatchedBuys ?? []) as Array<{ price: string; quantity: string }>;
+      s.unmatched = legacy.map((b) => ({ side: 'BUY' as const, price: b.price, quantity: b.quantity }));
+      delete s.unmatchedBuys;
+    }
+    if (typeof s.realizedPnlQuote !== 'string') s.realizedPnlQuote = '0';
+    if (typeof s.cyclesCompleted !== 'number') s.cyclesCompleted = 0;
   }
 
   async onOrderUpdate(
@@ -486,7 +523,7 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
   ): Promise<void> {
     const state = await ctx.loadState<GridSimpleState>();
     if (!state) return;
-    if (!Array.isArray(state.processedFills)) state.processedFills = [];
+    this._migrateState(state);
     const handled = await this._handleFill(ctx, params, state, event);
     if (handled) await ctx.saveState(state);
   }
@@ -521,23 +558,58 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
     // the next duplicate event won't re-place the counter.
     this._pushProcessed(state, event.clientOrderId);
     const filledQty = event.executedQty;
+    const halfTick = new Decimal(ctx.filters.tickSize).div(2);
+    const spread = new Decimal(params.gridSpread);
 
+    // ─── Symmetric cycle matching ────────────────────────────────────
+    // A cycle = one fill + its opposite-side closing leg. Per project spec:
+    //   • BUY-first cycle: BUY @ X → closed by SELL @ X+spread
+    //   • SELL-first cycle: SELL @ Y → closed by BUY @ Y-spread
+    // On close: realized += (sellPrice − buyPrice) × qty, cyclesCompleted += 1.
+    // Otherwise: this fill OPENS a cycle on its side.
+    let cycleClosed = false;
+    let cyclePnl = new Decimal(0);
     let counter: SimpleOrder | undefined;
+
     if (filled.side === 'BUY') {
+      // Try to close an existing SELL-first cycle (we sold @ filled.price+spread, now buying back).
+      const matchPrice = new Decimal(filled.price).plus(spread);
+      const mIdx = state.unmatched.findIndex(
+        (u) => u.side === 'SELL' && new Decimal(u.price).minus(matchPrice).abs().lte(halfTick),
+      );
+      if (mIdx > -1) {
+        const matched = state.unmatched.splice(mIdx, 1)[0]!;
+        // SELL-first cycle: profit = (sellPrice - buyPrice) × qty
+        cyclePnl = new Decimal(matched.price).minus(filled.price).mul(filledQty);
+        cycleClosed = true;
+      } else {
+        // OPEN a new BUY-first cycle. Held inventory waits for SELL above.
+        state.unmatched.push({ side: 'BUY', price: filled.price, quantity: filledQty });
+      }
       // Counter SELL one spread above
       const sellPrice = roundToTickSize(
-        new Decimal(filled.price).plus(params.gridSpread), ctx.filters.tickSize,
+        new Decimal(filled.price).plus(spread), ctx.filters.tickSize,
       );
       const sellQty = roundToStepSize(filledQty, ctx.filters.stepSize);
       counter = { status: 'pending', side: 'SELL', price: sellPrice, quantity: sellQty };
-      state.unmatchedBuys.push({ price: filled.price, quantity: filledQty });
-      await ctx.emit('BUY_FILLED',
-        `BUY filled @ ${filled.price} → placing SELL @ ${sellPrice}`,
-        { price: filled.price, quantity: filledQty, counterPrice: sellPrice });
     } else {
+      // SELL filled — try to close a BUY-first cycle (we bought @ filled.price-spread, now selling).
+      const matchPrice = new Decimal(filled.price).minus(spread);
+      const mIdx = state.unmatched.findIndex(
+        (u) => u.side === 'BUY' && new Decimal(u.price).minus(matchPrice).abs().lte(halfTick),
+      );
+      if (mIdx > -1) {
+        const matched = state.unmatched.splice(mIdx, 1)[0]!;
+        // BUY-first cycle: profit = (sellPrice - buyPrice) × qty
+        cyclePnl = new Decimal(filled.price).minus(matched.price).mul(filledQty);
+        cycleClosed = true;
+      } else {
+        // OPEN a new SELL-first cycle. Sold inventory waits for BUY below.
+        state.unmatched.push({ side: 'SELL', price: filled.price, quantity: filledQty });
+      }
       // Counter BUY one spread below
       const buyPrice = roundToTickSize(
-        new Decimal(filled.price).minus(params.gridSpread), ctx.filters.tickSize,
+        new Decimal(filled.price).minus(spread), ctx.filters.tickSize,
       );
       if (new Decimal(buyPrice).lte(0)) {
         ctx.logger.warn('Counter BUY price would be ≤0, skipping', { sellPrice: filled.price });
@@ -547,21 +619,28 @@ export class GridSimpleStrategy implements Strategy<GridSimpleParams> {
         );
         counter = { status: 'pending', side: 'BUY', price: buyPrice, quantity: buyQty };
       }
-      // Match against an unmatched buy at (price - spread) to realize PnL
-      const matchPrice = new Decimal(filled.price).minus(params.gridSpread);
-      const halfTick = new Decimal(ctx.filters.tickSize).div(2);
-      const mIdx = state.unmatchedBuys.findIndex(
-        (b) => new Decimal(b.price).minus(matchPrice).abs().lte(halfTick),
-      );
-      let pnl = '0';
-      if (mIdx > -1) {
-        const matched = state.unmatchedBuys.splice(mIdx, 1)[0]!;
-        pnl = new Decimal(filled.price).minus(matched.price).mul(filledQty).toString();
-      }
-      await ctx.emit('SELL_FILLED',
-        `SELL filled @ ${filled.price} (PnL ${pnl})`,
-        { price: filled.price, quantity: filledQty, pnl, counterPrice: counter?.price });
     }
+
+    // ─── Update realized P&L atomically when a cycle closes ──────────
+    if (cycleClosed) {
+      state.realizedPnlQuote = new Decimal(state.realizedPnlQuote ?? '0').plus(cyclePnl).toString();
+      state.cyclesCompleted = (state.cyclesCompleted ?? 0) + 1;
+    }
+
+    // ─── Single fill event with full cycle context ──────────────────
+    const eventType = filled.side === 'BUY' ? 'BUY_FILLED' : 'SELL_FILLED';
+    const eventMsg = cycleClosed
+      ? `${filled.side} filled @ ${filled.price} → cycle #${state.cyclesCompleted} closed (PnL ${cyclePnl.toFixed(8)})`
+      : `${filled.side} filled @ ${filled.price} → opened ${filled.side}-first cycle`;
+    await ctx.emit(eventType, eventMsg, {
+      price: filled.price,
+      quantity: filledQty,
+      counterPrice: counter?.price,
+      cycleClosed,
+      cyclePnl: cyclePnl.toString(),
+      cyclesCompleted: state.cyclesCompleted,
+      realizedPnlQuote: state.realizedPnlQuote,
+    });
 
     if (counter) {
       state.orders.push(counter);

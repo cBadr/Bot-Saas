@@ -166,11 +166,20 @@ export interface BotLive {
     latestEvent: { type: string; message: string; createdAt: string } | null;
   };
   pnl: {
-    cumulative: number;
+    /** Realized P&L (FDUSD): Σ (sell_price − buy_price) × qty over closed cycles. */
+    realized: number;
+    /** Unrealized (floating) P&L: (currentPrice − initialStartPrice) × heldQty. */
+    unrealized: number;
+    /** Total = realized + unrealized. */
+    total: number;
     cyclesCompleted: number;
     avgPerCycle: number;
     series: Array<{ ts: number; pnl: number }>;
-    unmatchedBuys: number;
+    /** Held base inventory from BUY-first cycles still open. */
+    heldQty: number;
+    /** Sold base inventory from SELL-first cycles still open. */
+    soldQty: number;
+    unmatchedCount: number;
   };
 }
 

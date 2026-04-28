@@ -88,6 +88,11 @@ export class BotsService {
         clientOrderId?: string; orderId?: number;
         lastError?: { code?: number; category?: string; msg?: string; ts: number };
       }>;
+      // New shape (post-2026-04-27)
+      unmatched?: Array<{ side: 'BUY' | 'SELL'; price: string; quantity: string }>;
+      realizedPnlQuote?: string;
+      cyclesCompleted?: number;
+      // Legacy shape (pre-migration)
       unmatchedBuys?: Array<{ price: string; quantity: string }>;
       startedAtMs?: number;
       nextReconcileAtMs?: number;
@@ -105,23 +110,25 @@ export class BotsService {
       orderBy: { createdAt: 'desc' },
     });
 
-    // Recent trades for the PnL sparkline (last 100, oldest→newest)
-    const trades = await this.prisma.trade.findMany({
-      where: { botId: id, realizedPnl: { not: null } },
-      orderBy: { executedAt: 'asc' },
-      take: 100,
-      select: { realizedPnl: true, executedAt: true, side: true, price: true },
-    });
+    // ─── Unmatched fills (new shape preferred, fall back to legacy) ───
+    const unmatched = state.unmatched
+      ?? (state.unmatchedBuys?.map((b) => ({
+        side: 'BUY' as const, price: b.price, quantity: b.quantity,
+      })) ?? []);
+    const heldQty = unmatched
+      .filter((u) => u.side === 'BUY')
+      .reduce((s, u) => s + Number(u.quantity), 0);
+    const soldQty = unmatched
+      .filter((u) => u.side === 'SELL')
+      .reduce((s, u) => s + Number(u.quantity), 0);
 
-    let cumulative = 0;
-    const pnlSeries = trades.map((t) => {
-      cumulative += Number(t.realizedPnl ?? 0);
-      return { ts: t.executedAt.getTime(), pnl: cumulative };
-    });
+    // ─── P&L per project spec (see memory: PnL definitions) ───
+    // Realized P&L: sourced from the strategy state — strategy maintains the
+    // exact running sum of (sell_price − buy_price) × qty per closed cycle.
+    const realized = Number(state.realizedPnlQuote ?? 0);
+    const cycles = state.cyclesCompleted ?? 0;
 
-    const cycles = trades.filter((t) => t.side === 'SELL').length;
-
-    // Live ticker for "where is the market vs our levels"
+    // Live ticker for "where is the market vs our levels" + Unrealized basis.
     let marketPrice: string | null = null;
     try {
       const pub = createPublicBinanceClient();
@@ -129,6 +136,35 @@ export class BotsService {
       marketPrice = ticker.price;
     } catch {
       // Non-fatal — UI will still render without it.
+    }
+
+    // Unrealized P&L (floating): (currentPrice − initialStartPrice) × heldQty.
+    // Uses START PRICE as reference per project spec (NOT weighted-avg cost).
+    let unrealized = 0;
+    const startNum = Number(state.initialStartPrice ?? 0);
+    const mktNum = Number(marketPrice ?? 0);
+    if (startNum > 0 && mktNum > 0 && heldQty > 0) {
+      unrealized = (mktNum - startNum) * heldQty;
+    }
+
+    const totalProfits = realized + unrealized;
+
+    // Historical series for the sparkline — derived from BotEvents (BUY_FILLED /
+    // SELL_FILLED carry cyclesCompleted + realizedPnlQuote snapshot in their data).
+    const cycleEvents = await this.prisma.botEvent.findMany({
+      where: {
+        botId: id,
+        type: { in: ['BUY_FILLED', 'SELL_FILLED'] },
+      },
+      orderBy: { createdAt: 'asc' },
+      take: 200,
+      select: { createdAt: true, data: true },
+    });
+    const pnlSeries: Array<{ ts: number; pnl: number }> = [];
+    for (const e of cycleEvents) {
+      const data = (e.data ?? {}) as { realizedPnlQuote?: string; cycleClosed?: boolean };
+      if (!data.cycleClosed) continue;
+      pnlSeries.push({ ts: e.createdAt.getTime(), pnl: Number(data.realizedPnlQuote ?? 0) });
     }
 
     return {
@@ -162,11 +198,18 @@ export class BotsService {
         } : null,
       },
       pnl: {
-        cumulative,
+        // Per project spec
+        realized,
+        unrealized,
+        total: totalProfits,
         cyclesCompleted: cycles,
-        avgPerCycle: cycles > 0 ? cumulative / cycles : 0,
+        avgPerCycle: cycles > 0 ? realized / cycles : 0,
+        // Historical curve of cumulative realized
         series: pnlSeries,
-        unmatchedBuys: state.unmatchedBuys?.length ?? 0,
+        // Inventory exposure
+        heldQty,
+        soldQty,
+        unmatchedCount: unmatched.length,
       },
     };
   }
