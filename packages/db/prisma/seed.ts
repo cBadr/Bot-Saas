@@ -153,11 +153,44 @@ async function main() {
       },
     },
     update: {
-      description: 'Periodic BUY (accumulate) or SELL (distribute) with flexible time and/or price gates.',
+      description: '[Deprecated — use DCA Simple] Periodic BUY/SELL with time/price gates. Kept for legacy bots.',
       version: 2,
     },
   });
-  console.log('  ✓ Built-in DCA strategy');
+  console.log('  ✓ Built-in DCA strategy (legacy)');
+
+  // ─── DCA Simple strategy (x2-style ladder DCA) ───
+  await prisma.strategy.upsert({
+    where: { builtinKey: 'dca_simple' },
+    create: {
+      name: 'DCA Simple',
+      description:
+        'Ladder DCA with single dynamic TP/BB. Places N LIMIT_MAKER orders descending (BUY) or ascending (SELL); maintains one counter at avg±takeProfit; on counter fill, realizes PnL and rebuilds ladder around new market.',
+      type: 'DCA',
+      visibility: 'BUILTIN',
+      builtinKey: 'dca_simple',
+      version: 1,
+      definition: { engine: 'dca_simple' },
+      paramsSchema: {
+        type: 'object',
+        required: ['direction', 'gridLevels', 'gridSpread', 'orderSize', 'takeProfit'],
+        properties: {
+          direction: { type: 'string', enum: ['BUY', 'SELL'], default: 'BUY' },
+          gridLevels: { type: 'integer', minimum: 1, maximum: 200 },
+          gridSpread: { type: 'number', exclusiveMinimum: 0 },
+          orderSize: { type: 'number', exclusiveMinimum: 0 },
+          takeProfit: { type: 'number', exclusiveMinimum: 0 },
+          durationMinutes: { type: 'integer', minimum: 0, default: 0 },
+          customStartPrice: { type: 'number', exclusiveMinimum: 0 },
+        },
+      },
+    },
+    update: {
+      description:
+        'Ladder DCA with single dynamic TP/BB. Places N LIMIT_MAKER orders descending (BUY) or ascending (SELL); maintains one counter at avg±takeProfit; on counter fill, realizes PnL and rebuilds ladder around new market.',
+    },
+  });
+  console.log('  ✓ Built-in DCA Simple strategy');
 
   // ─── MA Cross strategy ───
   await prisma.strategy.upsert({

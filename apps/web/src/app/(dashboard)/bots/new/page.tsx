@@ -61,6 +61,15 @@ interface FormData {
   gsDurationMinutes?: number;
   gsUseCustomStartPrice?: boolean;
   gsCustomStartPrice?: number;
+  // DcaSimple (x2-style ladder DCA)
+  dsDirection?: 'BUY' | 'SELL';
+  dsGridLevels?: number;
+  dsGridSpread?: number;
+  dsOrderSize?: number;
+  dsTakeProfit?: number;
+  dsDurationMinutes?: number;
+  dsUseCustomStartPrice?: boolean;
+  dsCustomStartPrice?: number;
   // Common risk
   paperTrading?: boolean;
   dailyLossLimit?: number;
@@ -83,6 +92,7 @@ export default function NewBotPage() {
   const isGrid = builtinKey === 'grid_v1';
   const isGridSimple = builtinKey === 'grid_simple';
   const isDCA = builtinKey === 'dca_v1';
+  const isDcaSimple = builtinKey === 'dca_simple';
   const isMACross = builtinKey === 'ma_cross_v1';
   const isGraph = selectedStrategy?.type === 'CUSTOM' && !isMACross;
 
@@ -100,6 +110,13 @@ export default function NewBotPage() {
       gsOrderSize: 10,
       gsDurationMinutes: 0,
       gsUseCustomStartPrice: false,
+      dsDirection: 'BUY',
+      dsGridLevels: 20,
+      dsGridSpread: 10,
+      dsOrderSize: 10,
+      dsTakeProfit: 50,
+      dsDurationMinutes: 0,
+      dsUseCustomStartPrice: false,
       cooldownSec: 60,
       dcaDirection: 'BUY',
       totalOrders: 20,
@@ -155,10 +172,11 @@ export default function NewBotPage() {
   const previewLevels = useMemo<PreviewLevel[]>(() => {
     if (isGrid) return buildGridPreview(w, resolvedAnchor);
     if (isGridSimple) return buildGridSimplePreview(w, marketPrice);
+    if (isDcaSimple) return buildDcaSimplePreview(w, marketPrice);
     if (isDCA) return buildDCAPreview(w);
     if (isMACross) return buildMACrossPreview(w);
     return [];
-  }, [w, isGrid, isGridSimple, isDCA, isMACross, resolvedAnchor, marketPrice]);
+  }, [w, isGrid, isGridSimple, isDcaSimple, isDCA, isMACross, resolvedAnchor, marketPrice]);
 
   const totals = useMemo<{ label: string; value: string }[]>(() => {
     const sumQuote = previewLevels.reduce((s, l) => s + l.quoteAmount, 0);
@@ -223,6 +241,16 @@ export default function NewBotPage() {
       params.durationMinutes = Number(data.gsDurationMinutes ?? 0);
       if (data.gsUseCustomStartPrice && data.gsCustomStartPrice) {
         params.customStartPrice = Number(data.gsCustomStartPrice);
+      }
+    } else if (isDcaSimple) {
+      params.direction = data.dsDirection ?? 'BUY';
+      params.gridLevels = Number(data.dsGridLevels);
+      params.gridSpread = Number(data.dsGridSpread);
+      params.orderSize = Number(data.dsOrderSize);
+      params.takeProfit = Number(data.dsTakeProfit);
+      params.durationMinutes = Number(data.dsDurationMinutes ?? 0);
+      if (data.dsUseCustomStartPrice && data.dsCustomStartPrice) {
+        params.customStartPrice = Number(data.dsCustomStartPrice);
       }
     } else if (isDCA) {
       params.direction = data.dcaDirection ?? 'BUY';
@@ -593,7 +621,132 @@ export default function NewBotPage() {
             </Card>
           )}
 
-          {/* ─── DCA ─── */}
+          {/* ─── DCA Simple (x2-style ladder DCA) ─── */}
+          {isDcaSimple && (
+            <Card>
+              <CardHeader>
+                <CardTitle>DCA Simple — Configuration</CardTitle>
+                <CardDescription>
+                  Ladder DCA: places N orders descending (BUY) or ascending (SELL) from current price.
+                  Each fill updates avg cost; a single TP/BB sits at avg ± takeProfit. On counter
+                  fill, realizes profit and rebuilds the ladder. Uses LIMIT_MAKER (zero fees).
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-5">
+                {/* Live ticker */}
+                <div className="rounded-md border bg-accent/20 px-3 py-2 flex items-center justify-between text-sm">
+                  <span className="text-muted-foreground">Live price ({watchedSymbol})</span>
+                  <span className="font-mono font-semibold">
+                    {marketPrice ? `$${marketPrice.toLocaleString(undefined, { maximumFractionDigits: 4 })}` : '—'}
+                  </span>
+                </div>
+
+                {/* Direction */}
+                <Field label="Direction" hint="BUY = accumulate below market, then liquidate at TP. SELL = distribute above market, then buy back.">
+                  <select
+                    className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                    {...register('dsDirection')}
+                  >
+                    <option value="BUY">BUY — accumulate (descending ladder)</option>
+                    <option value="SELL">SELL — distribute (ascending ladder)</option>
+                  </select>
+                </Field>
+
+                {/* Ladder shape */}
+                <div className="grid grid-cols-2 gap-4">
+                  <Field label="Ladder length" hint="Number of orders in the ladder (1–200).">
+                    <Input type="number" min={1} max={200}
+                      {...register('dsGridLevels', { required: true, valueAsNumber: true })} />
+                  </Field>
+                  <Field label="Spread ($)" hint="Distance between adjacent rungs.">
+                    <Input type="number" step="any" min={0.00001}
+                      {...register('dsGridSpread', { required: true, valueAsNumber: true })} />
+                  </Field>
+                </div>
+
+                {/* Sizing & TP */}
+                <div className="grid grid-cols-2 gap-4">
+                  <Field label={`Order size (${quoteAsset})`} hint="Quote $ per ladder order.">
+                    <Input type="number" step="any" min={0.0001}
+                      {...register('dsOrderSize', { required: true, valueAsNumber: true })} />
+                  </Field>
+                  <Field label="Take profit ($)" hint={
+                    w.dsDirection === 'SELL'
+                      ? 'BB target = avg sell − this. Buy back below avg.'
+                      : 'TP target = avg cost + this. Liquidate above avg.'
+                  }>
+                    <Input type="number" step="any" min={0.00001}
+                      {...register('dsTakeProfit', { required: true, valueAsNumber: true })} />
+                  </Field>
+                </div>
+
+                {/* Duration */}
+                <Field label="Duration (minutes)" hint="0 = run until you stop it.">
+                  <Input type="number" min={0}
+                    {...register('dsDurationMinutes', { valueAsNumber: true })} />
+                </Field>
+
+                {/* Custom start price */}
+                <div className="rounded-md border bg-accent/10 p-3 space-y-2">
+                  <label className="flex items-start gap-2 text-sm cursor-pointer">
+                    <input type="checkbox" className="mt-0.5"
+                      {...register('dsUseCustomStartPrice')} />
+                    <div>
+                      <div className="font-medium">Use custom start price</div>
+                      <div className="text-xs text-muted-foreground">
+                        Override the live ticker. The ladder will be built around this price instead.
+                      </div>
+                    </div>
+                  </label>
+                  {w.dsUseCustomStartPrice && (
+                    <Field label="Custom start price">
+                      <Input type="number" step="any" min={0.00001} placeholder="e.g. 78000"
+                        {...register('dsCustomStartPrice', { valueAsNumber: true })} />
+                    </Field>
+                  )}
+                </div>
+
+                {/* Capital summary */}
+                {(() => {
+                  const N = Number(w.dsGridLevels);
+                  const sz = Number(w.dsOrderSize);
+                  const sp = Number(w.dsGridSpread);
+                  const tp = Number(w.dsTakeProfit);
+                  const dir = w.dsDirection ?? 'BUY';
+                  if (!Number.isFinite(N) || !Number.isFinite(sz) || N < 1 || sz <= 0) return null;
+                  const totalCapital = N * sz;
+                  const profitPerCycle = (Number.isFinite(tp) && tp > 0 && marketPrice)
+                    ? tp * (totalCapital / marketPrice)
+                    : 0;
+                  const ladderRange = (Number.isFinite(sp) && sp > 0 && marketPrice)
+                    ? dir === 'BUY'
+                      ? `${(marketPrice - sp).toFixed(2)} → ${(marketPrice - sp * N).toFixed(2)}`
+                      : `${(marketPrice + sp).toFixed(2)} → ${(marketPrice + sp * N).toFixed(2)}`
+                    : '—';
+                  return (
+                    <div className="rounded border bg-muted/30 px-3 py-2 text-xs space-y-1 font-mono">
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">Ladder range:</span>
+                        <span className="font-semibold">{ladderRange}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">{quoteAsset} required:</span>
+                        <span className="font-semibold">${totalCapital.toFixed(2)}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-muted-foreground">Approx profit / cycle (full ladder):</span>
+                        <span className="font-semibold text-success">
+                          ~${profitPerCycle.toFixed(4)}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })()}
+              </CardContent>
+            </Card>
+          )}
+
+          {/* ─── DCA (legacy) ─── */}
           {isDCA && (
             <Card>
               <CardHeader>
@@ -754,7 +907,9 @@ export default function NewBotPage() {
             emptyMessage="Fill the form to see a live order map."
             anchorPrice={isGridSimple
               ? (w.gsUseCustomStartPrice && w.gsCustomStartPrice ? Number(w.gsCustomStartPrice) : marketPrice)
-              : resolvedAnchor}
+              : isDcaSimple
+                ? (w.dsUseCustomStartPrice && w.dsCustomStartPrice ? Number(w.dsCustomStartPrice) : marketPrice)
+                : resolvedAnchor}
             initialPositionPct={w.initialPositionPct ? Number(w.initialPositionPct) : undefined}
             useExistingInventory={w.useExistingInventory || undefined}
             existingInventoryPct={w.existingInventoryPct ? Number(w.existingInventoryPct) : undefined}
@@ -865,6 +1020,51 @@ function buildGridSimplePreview(w: FormData, marketPrice?: number): PreviewLevel
       out.push({ index: -i, price: buyPrice, quoteAmount: orderSize, baseQty: orderSize / buyPrice, side: 'BUY' });
     }
     out.push({ index: i, price: sellPrice, quoteAmount: orderSize, baseQty: orderSize / sellPrice, side: 'SELL' });
+  }
+  return out;
+}
+
+function buildDcaSimplePreview(w: FormData, marketPrice?: number): PreviewLevel[] {
+  const N = Number(w.dsGridLevels);
+  const spread = Number(w.dsGridSpread);
+  const orderSize = Number(w.dsOrderSize);
+  const tp = Number(w.dsTakeProfit);
+  const dir = w.dsDirection ?? 'BUY';
+  const start = w.dsUseCustomStartPrice && w.dsCustomStartPrice
+    ? Number(w.dsCustomStartPrice)
+    : marketPrice;
+  if (!start || !Number.isFinite(N) || N < 1
+      || !Number.isFinite(spread) || spread <= 0
+      || !Number.isFinite(orderSize) || orderSize <= 0) return [];
+
+  const out: PreviewLevel[] = [];
+  for (let i = 1; i <= N; i++) {
+    const offset = i * spread;
+    const price = dir === 'BUY' ? start - offset : start + offset;
+    if (price <= 0) continue;
+    out.push({
+      index: dir === 'BUY' ? -i : i,
+      price,
+      quoteAmount: orderSize,
+      baseQty: orderSize / price,
+      side: dir,
+    });
+  }
+  // Approximate counter (TP/BB) marker at the *expected* avg + tp:
+  // After filling all N rungs, avg = (Σ price_i × qty_i) / Σ qty_i.
+  if (Number.isFinite(tp) && tp > 0 && out.length > 0) {
+    const totalQty = out.reduce((s, l) => s + l.baseQty, 0);
+    const totalQuote = out.reduce((s, l) => s + l.quoteAmount, 0);
+    const avg = totalQuote / totalQty;
+    const counterPrice = dir === 'BUY' ? avg + tp : avg - tp;
+    const counterSide = dir === 'BUY' ? 'SELL' : 'BUY';
+    out.push({
+      index: dir === 'BUY' ? N + 1 : -(N + 1),
+      price: counterPrice,
+      quoteAmount: totalQuote,
+      baseQty: totalQty,
+      side: counterSide,
+    });
   }
   return out;
 }

@@ -63,13 +63,13 @@ export class BotsService {
       };
       const params = (b.params ?? {}) as Record<string, unknown>;
       const builtinKey = b.strategy?.builtinKey ?? null;
-      const isDCA = builtinKey === 'dca_v1';
+      const isAnyDca = builtinKey === 'dca_v1' || builtinKey === 'dca_simple';
       const dcaDirection = (params.direction === 'SELL' ? 'SELL' : 'BUY');
 
       // ─── Compute signed held inventory for unrealized math ───
       let heldQty = 0;
       let signedHeld = 0;
-      if (isDCA) {
+      if (isAnyDca) {
         const dh = Number(state.heldBase ?? 0);
         heldQty = dh;
         signedHeld = dcaDirection === 'BUY' ? +dh : -dh;
@@ -191,17 +191,22 @@ export class BotsService {
       strategy: { select: { builtinKey: true, name: true } },
     }) as { id: string; symbol: string; state: unknown; params: unknown; strategy?: { builtinKey?: string | null } };
 
+    type StateOrder = {
+      side: 'BUY' | 'SELL'; price: string; quantity: string; status: string;
+      clientOrderId?: string; orderId?: number;
+      lastError?: { code?: number; category?: string; msg?: string; ts: number };
+    };
     const state = (bot.state ?? {}) as {
       initialStartPrice?: string;
       // ─ Grid Simple shape ─
-      orders?: Array<{
-        side: 'BUY' | 'SELL'; price: string; quantity: string; status: string;
-        clientOrderId?: string; orderId?: number;
-        lastError?: { code?: number; category?: string; msg?: string; ts: number };
-      }>;
+      orders?: StateOrder[];
       unmatched?: Array<{ side: 'BUY' | 'SELL'; price: string; quantity: string }>;
       unmatchedBuys?: Array<{ price: string; quantity: string }>;  // legacy
-      // ─ DCA shape ─
+      // ─ DCA Simple shape ─
+      ladder?: StateOrder[];
+      counter?: { side: 'BUY' | 'SELL'; price: string; quantity: string; status: string;
+                  clientOrderId?: string; orderId?: number; type?: string } | null;
+      // ─ DCA (legacy + simple) shape ─
       heldBase?: string;
       avgPrice?: string;
       ordersExecuted?: number;
@@ -215,17 +220,36 @@ export class BotsService {
 
     const strategyKey = bot.strategy?.builtinKey ?? null;
     const isDCA = strategyKey === 'dca_v1';
+    const isDcaSimple = strategyKey === 'dca_simple';
+    const isAnyDca = isDCA || isDcaSimple;
     const params = (bot.params ?? {}) as Record<string, unknown>;
     const dcaDirection = (params.direction === 'SELL' ? 'SELL' : 'BUY') as 'BUY' | 'SELL';
 
-    const orders = state.orders ?? [];
+    // For DCA Simple, expose ladder + counter as a unified `orders` array so
+    // the LiveTradingChart can overlay them just like Grid Simple does.
+    let orders: StateOrder[];
+    if (isDcaSimple) {
+      orders = [...(state.ladder ?? [])];
+      if (state.counter) {
+        orders.push({
+          side: state.counter.side,
+          price: state.counter.price,
+          quantity: state.counter.quantity,
+          status: state.counter.status,
+          clientOrderId: state.counter.clientOrderId,
+          orderId: state.counter.orderId,
+        });
+      }
+    } else {
+      orders = state.orders ?? [];
+    }
     const breakdown: Record<string, number> = {};
     for (const o of orders) breakdown[o.status] = (breakdown[o.status] ?? 0) + 1;
     const open = breakdown['open'] ?? 0;
 
     // Latest integrity event
     const integrityEvent = await this.prisma.botEvent.findFirst({
-      where: { botId: id, type: { in: ['GRID_INTEGRITY_OK', 'GRID_INTEGRITY_REPAIR'] } },
+      where: { botId: id, type: { in: ['GRID_INTEGRITY_OK', 'GRID_INTEGRITY_REPAIR', 'DCA_INTEGRITY_OK', 'DCA_INTEGRITY_REPAIR'] } },
       orderBy: { createdAt: 'desc' },
     });
 
@@ -234,8 +258,8 @@ export class BotsService {
     let soldQty = 0;
     let signedHeld = 0;
 
-    if (isDCA) {
-      // DCA stores a single positive heldBase; sign comes from direction.
+    if (isAnyDca) {
+      // DCA (both legacy + simple) store a single positive heldBase; sign comes from direction.
       const dh = Number(state.heldBase ?? 0);
       if (dcaDirection === 'BUY') {
         heldQty = dh;
@@ -294,6 +318,8 @@ export class BotsService {
     const cycleEvents = await this.prisma.botEvent.findMany({
       where: {
         botId: id,
+        // Grid Simple emits BUY_FILLED / SELL_FILLED.
+        // DCA (both legacy and simple) emit DCA_BUY_FILLED / DCA_SELL_FILLED.
         type: { in: ['BUY_FILLED', 'SELL_FILLED', 'DCA_BUY_FILLED', 'DCA_SELL_FILLED'] },
       },
       orderBy: { createdAt: 'asc' },
