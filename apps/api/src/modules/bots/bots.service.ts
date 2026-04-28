@@ -52,38 +52,55 @@ export class BotsService {
     return bots.map((b) => {
       const state = (b.state ?? {}) as {
         initialStartPrice?: string;
+        // Grid Simple
         unmatched?: Array<{ side: 'BUY' | 'SELL'; price: string; quantity: string }>;
         unmatchedBuys?: Array<{ price: string; quantity: string }>;
+        // DCA
+        heldBase?: string;
+        // Common
         realizedPnlQuote?: string;
         cyclesCompleted?: number;
       };
       const params = (b.params ?? {}) as Record<string, unknown>;
+      const builtinKey = b.strategy?.builtinKey ?? null;
+      const isDCA = builtinKey === 'dca_v1';
+      const dcaDirection = (params.direction === 'SELL' ? 'SELL' : 'BUY');
 
-      // Held base inventory (BUY-side unmatched only — per spec, used for unrealized)
-      const unmatched = state.unmatched
-        ?? (state.unmatchedBuys?.map((u) => ({ side: 'BUY' as const, price: u.price, quantity: u.quantity })) ?? []);
-      const heldQty = unmatched
-        .filter((u) => u.side === 'BUY')
-        .reduce((s, u) => s + Number(u.quantity), 0);
+      // ─── Compute signed held inventory for unrealized math ───
+      let heldQty = 0;
+      let signedHeld = 0;
+      if (isDCA) {
+        const dh = Number(state.heldBase ?? 0);
+        heldQty = dh;
+        signedHeld = dcaDirection === 'BUY' ? +dh : -dh;
+      } else {
+        const unmatched = state.unmatched
+          ?? (state.unmatchedBuys?.map((u) => ({ side: 'BUY' as const, price: u.price, quantity: u.quantity })) ?? []);
+        const buyQty = unmatched.filter((u) => u.side === 'BUY').reduce((s, u) => s + Number(u.quantity), 0);
+        const sellQty = unmatched.filter((u) => u.side === 'SELL').reduce((s, u) => s + Number(u.quantity), 0);
+        heldQty = buyQty;
+        signedHeld = buyQty - sellQty;
+      }
 
       const startNum = Number(state.initialStartPrice ?? 0);
       const marketNum = Number(priceMap.get(b.symbol) ?? 0);
       const realized = Number(state.realizedPnlQuote ?? 0);
-      const unrealized = (startNum > 0 && marketNum > 0 && heldQty > 0)
-        ? (marketNum - startNum) * heldQty
+      const unrealized = (startNum > 0 && marketNum > 0 && signedHeld !== 0)
+        ? (marketNum - startNum) * signedHeld
         : 0;
       const total = realized + unrealized;
       const cycles = state.cyclesCompleted ?? 0;
 
-      // Grid Simple params readout (gracefully handles other strategies)
+      // Strategy-specific params readout
       const gridLevels = num(params.gridLevels);
       const gridSpread = num(params.gridSpread);
       const orderSize = num(params.orderSize);
       const totalInvestment = (gridLevels !== null && orderSize !== null)
-        // x2 model: 2 × N orders × orderSize, but only BUYs need quote upfront → N × orderSize
         ? gridLevels * orderSize
-        : null;
-      // Expected profit per cycle = spread × (orderSize / startPrice)
+        : num(params.totalQuoteInvestment);
+      // Expected per-cycle profit:
+      //   Grid:  spread × (orderSize / startPrice)
+      //   DCA:   not well-defined (depends on TP%); skip
       const expectedPerCycle = (gridSpread !== null && orderSize !== null && startNum > 0)
         ? gridSpread * (orderSize / startNum)
         : null;
@@ -172,25 +189,34 @@ export class BotsService {
   async live(userId: string, id: string) {
     const bot = await this.findOwned(userId, id, {
       strategy: { select: { builtinKey: true, name: true } },
-    }) as { id: string; symbol: string; state: unknown; strategy?: { builtinKey?: string | null } };
+    }) as { id: string; symbol: string; state: unknown; params: unknown; strategy?: { builtinKey?: string | null } };
 
     const state = (bot.state ?? {}) as {
       initialStartPrice?: string;
+      // ─ Grid Simple shape ─
       orders?: Array<{
         side: 'BUY' | 'SELL'; price: string; quantity: string; status: string;
         clientOrderId?: string; orderId?: number;
         lastError?: { code?: number; category?: string; msg?: string; ts: number };
       }>;
-      // New shape (post-2026-04-27)
       unmatched?: Array<{ side: 'BUY' | 'SELL'; price: string; quantity: string }>;
+      unmatchedBuys?: Array<{ price: string; quantity: string }>;  // legacy
+      // ─ DCA shape ─
+      heldBase?: string;
+      avgPrice?: string;
+      ordersExecuted?: number;
+      // ─ Common ─
       realizedPnlQuote?: string;
       cyclesCompleted?: number;
-      // Legacy shape (pre-migration)
-      unmatchedBuys?: Array<{ price: string; quantity: string }>;
       startedAtMs?: number;
       nextReconcileAtMs?: number;
       processedFills?: string[];
     };
+
+    const strategyKey = bot.strategy?.builtinKey ?? null;
+    const isDCA = strategyKey === 'dca_v1';
+    const params = (bot.params ?? {}) as Record<string, unknown>;
+    const dcaDirection = (params.direction === 'SELL' ? 'SELL' : 'BUY') as 'BUY' | 'SELL';
 
     const orders = state.orders ?? [];
     const breakdown: Record<string, number> = {};
@@ -203,21 +229,33 @@ export class BotsService {
       orderBy: { createdAt: 'desc' },
     });
 
-    // ─── Unmatched fills (new shape preferred, fall back to legacy) ───
-    const unmatched = state.unmatched
-      ?? (state.unmatchedBuys?.map((b) => ({
-        side: 'BUY' as const, price: b.price, quantity: b.quantity,
-      })) ?? []);
-    const heldQty = unmatched
-      .filter((u) => u.side === 'BUY')
-      .reduce((s, u) => s + Number(u.quantity), 0);
-    const soldQty = unmatched
-      .filter((u) => u.side === 'SELL')
-      .reduce((s, u) => s + Number(u.quantity), 0);
+    // ─── Inventory exposure (signed for unrealized math) ───
+    let heldQty = 0;
+    let soldQty = 0;
+    let signedHeld = 0;
+
+    if (isDCA) {
+      // DCA stores a single positive heldBase; sign comes from direction.
+      const dh = Number(state.heldBase ?? 0);
+      if (dcaDirection === 'BUY') {
+        heldQty = dh;
+        signedHeld = +dh;
+      } else {
+        soldQty = dh;
+        signedHeld = -dh;
+      }
+    } else {
+      // Grid Simple: derive from unmatched array (with legacy fallback).
+      const unmatched = state.unmatched
+        ?? (state.unmatchedBuys?.map((b) => ({
+          side: 'BUY' as const, price: b.price, quantity: b.quantity,
+        })) ?? []);
+      heldQty = unmatched.filter((u) => u.side === 'BUY').reduce((s, u) => s + Number(u.quantity), 0);
+      soldQty = unmatched.filter((u) => u.side === 'SELL').reduce((s, u) => s + Number(u.quantity), 0);
+      signedHeld = heldQty - soldQty;
+    }
 
     // ─── P&L per project spec (see memory: PnL definitions) ───
-    // Realized P&L: sourced from the strategy state — strategy maintains the
-    // exact running sum of (sell_price − buy_price) × qty per closed cycle.
     const realized = Number(state.realizedPnlQuote ?? 0);
     const cycles = state.cyclesCompleted ?? 0;
 
@@ -231,13 +269,12 @@ export class BotsService {
       // Non-fatal — UI will still render without it.
     }
 
-    // Unrealized P&L (floating): (currentPrice − initialStartPrice) × heldQty.
-    // Uses START PRICE as reference per project spec (NOT weighted-avg cost).
+    // Unrealized P&L (floating): (currentPrice − initialStartPrice) × signedHeld.
     let unrealized = 0;
     const startNum = Number(state.initialStartPrice ?? 0);
     const mktNum = Number(marketPrice ?? 0);
-    if (startNum > 0 && mktNum > 0 && heldQty > 0) {
-      unrealized = (mktNum - startNum) * heldQty;
+    if (startNum > 0 && mktNum > 0 && signedHeld !== 0) {
+      unrealized = (mktNum - startNum) * signedHeld;
     }
 
     const totalProfits = realized + unrealized;
@@ -250,12 +287,14 @@ export class BotsService {
     });
     const totalVolume = Number(volumeAgg._sum.quoteQuantity ?? 0);
 
-    // Historical series for the sparkline — derived from BotEvents (BUY_FILLED /
-    // SELL_FILLED carry cyclesCompleted + realizedPnlQuote snapshot in their data).
+    // Historical series for the sparkline — derived from fill events that carry
+    // realizedPnlQuote snapshot in their `data` payload.
+    //   Grid Simple: BUY_FILLED / SELL_FILLED
+    //   DCA:         DCA_BUY_FILLED / DCA_SELL_FILLED
     const cycleEvents = await this.prisma.botEvent.findMany({
       where: {
         botId: id,
-        type: { in: ['BUY_FILLED', 'SELL_FILLED'] },
+        type: { in: ['BUY_FILLED', 'SELL_FILLED', 'DCA_BUY_FILLED', 'DCA_SELL_FILLED'] },
       },
       orderBy: { createdAt: 'asc' },
       take: 200,
@@ -310,7 +349,7 @@ export class BotsService {
         // Inventory exposure
         heldQty,
         soldQty,
-        unmatchedCount: unmatched.length,
+        signedHeld,
       },
       volume: {
         totalQuote: totalVolume,

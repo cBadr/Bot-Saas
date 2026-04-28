@@ -193,11 +193,12 @@ export interface BotLive {
     cyclesCompleted: number;
     avgPerCycle: number;
     series: Array<{ ts: number; pnl: number }>;
-    /** Held base inventory from BUY-first cycles still open. */
+    /** Held base inventory from BUY-side opens (positive). */
     heldQty: number;
-    /** Sold base inventory from SELL-first cycles still open. */
+    /** Sold base inventory from SELL-side opens. */
     soldQty: number;
-    unmatchedCount: number;
+    /** Net signed exposure used for unrealized math (+held −sold). */
+    signedHeld: number;
   };
   volume: {
     /** Total notional traded in quote (FDUSD). Σ trade.quoteQuantity. */

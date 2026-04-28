@@ -38,13 +38,44 @@ export const DCAParamsSchema = z.object({
 );
 export type DCAParams = z.infer<typeof DCAParamsSchema>;
 
+/**
+ * DCA bot state. P&L tracking aligned with the project-wide spec:
+ *
+ *   Realized P&L = Σ over closing fills of (sellPrice − buyCostBasis) × qty
+ *                  (sign-flipped for SELL-direction bots)
+ *   Unrealized   = (currentPrice − initialStartPrice) × signedHeldQty
+ *                  signedHeldQty = +heldBase (BUY mode) | −heldBase (SELL mode)
+ *   Total        = Realized + Unrealized
+ *
+ * Field semantics depend on `direction`:
+ *   BUY mode  → heldBase = inventory accumulated from BUYs (decremented on closing SELLs)
+ *               openCostBasis = total cost spent on currently-held inventory
+ *   SELL mode → heldBase = cumulative SELL qty awaiting BB (decremented on closing BUYs)
+ *               openCostBasis = total proceeds received from those SELLs
+ *
+ *   avgPrice = openCostBasis / heldBase (when heldBase > 0)
+ */
 interface DCAState {
   ordersExecuted: number;
-  baseHeld: string;        // total base accumulated (BUY) or remaining to sell (SELL)
-  avgCost: string;         // weighted avg cost (BUY) or avg sell price (SELL)
-  lastOrderAt: number;     // ms
-  lastFillPrice: string;   // last fill price for price-gate comparison
-  totalSpentQuote: string; // BUY: spent quote; SELL: received quote
+  lastOrderAt: number;        // ms
+  lastFillPrice: string;      // last fill price for price-gate comparison
+  totalSpentQuote: string;    // BUY: cumulative spent; SELL: cumulative received
+
+  // Position tracking
+  heldBase: string;
+  openCostBasis: string;
+  avgPrice: string;
+
+  // P&L tracking (project spec)
+  initialStartPrice: string;  // captured once at bot launch — Unrealized reference
+  realizedPnlQuote: string;
+  cyclesCompleted: number;
+
+  // ── Legacy field kept for one-time migration from older state shape ──
+  /** @deprecated migrated into `heldBase` on load. */
+  baseHeld?: string;
+  /** @deprecated migrated into `avgPrice` on load. */
+  avgCost?: string;
 }
 
 /**
@@ -63,66 +94,177 @@ export class DCAStrategy implements Strategy<DCAParams> {
 
   async init(ctx: StrategyContext, params: DCAParams): Promise<void> {
     const existing = await ctx.loadState<DCAState>();
-    if (!existing) {
-      await ctx.saveState({
-        ordersExecuted: 0,
-        baseHeld: '0',
-        avgCost: '0',
-        lastOrderAt: 0,
-        lastFillPrice: '0',
-        totalSpentQuote: '0',
-      } satisfies DCAState);
-      const gates: string[] = [];
-      if (params.intervalMinutes) gates.push(`every ${params.intervalMinutes}m`);
-      if (params.minPriceMovePct) gates.push(`on ${params.minPriceMovePct}% ${params.direction === 'BUY' ? 'drop' : 'rise'}`);
-      await ctx.emit(
-        'DCA_INITIALIZED',
-        `${params.direction} ${params.totalOrders} orders ${gates.join(' & ')}`,
-      );
-    } else {
-      ctx.logger.info('Resuming DCA from saved state', { ...existing });
+    if (existing) {
+      this._migrateState(existing);
+      await ctx.saveState(existing);
+      ctx.logger.info('Resuming DCA from saved state', {
+        ordersExecuted: existing.ordersExecuted,
+        heldBase: existing.heldBase,
+        realized: existing.realizedPnlQuote,
+        cycles: existing.cyclesCompleted,
+      });
+      await ctx.emit('DCA_RESUMED',
+        `Resumed DCA: ${existing.ordersExecuted}/${params.totalOrders} fills, realized=${existing.realizedPnlQuote}, cycles=${existing.cyclesCompleted}`);
+      return;
     }
+
+    // Fresh start — capture the launch ticker as the Unrealized reference.
+    const ticker = await ctx.client.getTickerPrice(ctx.symbol);
+    const startPrice = roundToTickSize(ticker.price, ctx.filters.tickSize);
+
+    await ctx.saveState({
+      ordersExecuted: 0,
+      lastOrderAt: 0,
+      lastFillPrice: '0',
+      totalSpentQuote: '0',
+      heldBase: '0',
+      openCostBasis: '0',
+      avgPrice: '0',
+      initialStartPrice: startPrice,
+      realizedPnlQuote: '0',
+      cyclesCompleted: 0,
+    } satisfies DCAState);
+
+    const gates: string[] = [];
+    if (params.intervalMinutes) gates.push(`every ${params.intervalMinutes}m`);
+    if (params.minPriceMovePct) gates.push(`on ${params.minPriceMovePct}% ${params.direction === 'BUY' ? 'drop' : 'rise'}`);
+    if (params.minPriceMoveDollar) gates.push(`on $${params.minPriceMoveDollar} ${params.direction === 'BUY' ? 'drop' : 'rise'}`);
+    await ctx.emit(
+      'DCA_INITIALIZED',
+      `${params.direction} ${params.totalOrders} orders ${gates.join(' & ')} · start ${startPrice}`,
+      { direction: params.direction, totalOrders: params.totalOrders, startPrice },
+    );
+  }
+
+  /**
+   * Migrate legacy state shape in-place. Older DCA bots had `baseHeld` /
+   * `avgCost` instead of `heldBase` / `avgPrice` and lacked the P&L
+   * tracking fields entirely.
+   */
+  private _migrateState(s: DCAState): void {
+    if (typeof s.heldBase !== 'string') {
+      s.heldBase = s.baseHeld ?? '0';
+      delete s.baseHeld;
+    }
+    if (typeof s.avgPrice !== 'string') {
+      s.avgPrice = s.avgCost ?? '0';
+      delete s.avgCost;
+    }
+    if (typeof s.openCostBasis !== 'string') {
+      // Best-effort reconstruction: avgPrice × heldBase
+      const held = new Decimal(s.heldBase || '0');
+      const avg = new Decimal(s.avgPrice || '0');
+      s.openCostBasis = held.gt(0) && avg.gt(0) ? held.mul(avg).toString() : '0';
+    }
+    if (typeof s.initialStartPrice !== 'string') s.initialStartPrice = s.lastFillPrice || '0';
+    if (typeof s.realizedPnlQuote !== 'string') s.realizedPnlQuote = '0';
+    if (typeof s.cyclesCompleted !== 'number') s.cyclesCompleted = 0;
   }
 
   async onOrderUpdate(ctx: StrategyContext, params: DCAParams, event: StrategyOrderEvent): Promise<void> {
     if (event.status !== 'FILLED') return;
     const state = (await ctx.loadState<DCAState>())!;
+    this._migrateState(state);
+
     const fillPrice = new Decimal(event.price);
     const fillQty = new Decimal(event.executedQty);
     const fillQuote = fillPrice.mul(fillQty);
 
-    if (event.side === 'BUY') {
-      // Update weighted avg cost
-      const oldHeld = new Decimal(state.baseHeld);
-      const oldAvg = new Decimal(state.avgCost);
-      const newHeld = oldHeld.plus(fillQty);
-      state.avgCost = newHeld.gt(0)
-        ? oldHeld.mul(oldAvg).plus(fillQty.mul(fillPrice)).div(newHeld).toString()
-        : fillPrice.toString();
-      state.baseHeld = newHeld.toString();
-      if (params.direction === 'BUY') state.totalSpentQuote = new Decimal(state.totalSpentQuote).plus(fillQuote).toString();
+    // Identify the leg type:
+    //   "opening" = same side as direction (BUY in BUY-mode, SELL in SELL-mode) → adds to position
+    //   "closing" = opposite side → realizes P&L by releasing proportional cost basis
+    const isOpeningLeg = event.side === params.direction;
+
+    let cyclePnl = new Decimal(0);
+    let cycleClosed = false;
+
+    if (isOpeningLeg) {
+      // Add to position
+      const newHeld = new Decimal(state.heldBase).plus(fillQty);
+      const newBasis = new Decimal(state.openCostBasis).plus(fillQuote);
+      state.heldBase = newHeld.toString();
+      state.openCostBasis = newBasis.toString();
+      state.avgPrice = newHeld.gt(0) ? newBasis.div(newHeld).toString() : '0';
+      state.totalSpentQuote = new Decimal(state.totalSpentQuote).plus(fillQuote).toString();
     } else {
-      // SELL: reduce held base
-      state.baseHeld = Decimal.max(0, new Decimal(state.baseHeld).minus(fillQty)).toString();
-      if (params.direction === 'SELL') state.totalSpentQuote = new Decimal(state.totalSpentQuote).plus(fillQuote).toString();
+      // Closing leg — realize P&L proportionally based on stored cost basis.
+      const heldBefore = new Decimal(state.heldBase);
+      if (heldBefore.lte(0)) {
+        // Closing fill but we have no recorded position (e.g. SELL-mode bot's
+        // very first BUY-back without prior tracking). Skip realized accounting.
+        ctx.logger.warn('DCA closing fill with no recorded position — skipping P&L', {
+          side: event.side, qty: event.executedQty,
+        });
+      } else {
+        const closeQty = Decimal.min(fillQty, heldBefore);
+        const avgPrice = new Decimal(state.avgPrice);
+        const basisReleased = avgPrice.mul(closeQty);
+
+        // Direction-aware realized P&L:
+        //   BUY-mode close (SELL fill):   pnl = (sellPrice − avgCost)     × qty
+        //   SELL-mode close (BUY fill):   pnl = (avgSellPrice − buyPrice) × qty
+        cyclePnl = params.direction === 'BUY'
+          ? fillPrice.minus(avgPrice).mul(closeQty)
+          : avgPrice.minus(fillPrice).mul(closeQty);
+
+        state.realizedPnlQuote = new Decimal(state.realizedPnlQuote).plus(cyclePnl).toString();
+        state.heldBase = heldBefore.minus(closeQty).toString();
+        state.openCostBasis = Decimal.max(
+          0, new Decimal(state.openCostBasis).minus(basisReleased),
+        ).toString();
+        // Recompute avgPrice if any inventory remains; reset if fully closed.
+        const remaining = new Decimal(state.heldBase);
+        state.avgPrice = remaining.gt(0)
+          ? new Decimal(state.openCostBasis).div(remaining).toString()
+          : '0';
+
+        // A cycle is "closed" when the position is fully released.
+        if (remaining.lte(new Decimal(ctx.filters.stepSize).mul(0.5))) {
+          state.cyclesCompleted += 1;
+          cycleClosed = true;
+          // Clean up tiny dust to avoid drift
+          state.heldBase = '0';
+          state.openCostBasis = '0';
+        }
+      }
+      state.totalSpentQuote = new Decimal(state.totalSpentQuote).plus(fillQuote).toString();
     }
 
     state.ordersExecuted += 1;
     state.lastOrderAt = Date.now();
     state.lastFillPrice = fillPrice.toString();
 
-    await ctx.emit(`DCA_${event.side}_FILLED`, `${event.side} #${state.ordersExecuted}/${params.totalOrders} @ ${event.price}`);
+    const evtType = `DCA_${event.side}_FILLED`;
+    const evtMsg = isOpeningLeg
+      ? `${event.side} #${state.ordersExecuted} @ ${event.price} → opening leg (avg ${new Decimal(state.avgPrice).toFixed(8)})`
+      : cycleClosed
+        ? `${event.side} #${state.ordersExecuted} @ ${event.price} → cycle #${state.cyclesCompleted} closed (PnL ${cyclePnl.toFixed(8)})`
+        : `${event.side} #${state.ordersExecuted} @ ${event.price} → partial close (PnL ${cyclePnl.toFixed(8)})`;
+
+    await ctx.emit(evtType, evtMsg, {
+      price: event.price,
+      quantity: event.executedQty,
+      isOpeningLeg,
+      cycleClosed,
+      cyclePnl: cyclePnl.toString(),
+      cyclesCompleted: state.cyclesCompleted,
+      realizedPnlQuote: state.realizedPnlQuote,
+      heldBase: state.heldBase,
+      avgPrice: state.avgPrice,
+    });
     await ctx.saveState(state);
   }
 
   async onTick(ctx: StrategyContext, params: DCAParams, lastPriceStr: string): Promise<void> {
     const state = (await ctx.loadState<DCAState>())!;
+    this._migrateState(state);
     const lastPrice = new Decimal(lastPriceStr);
     const now = Date.now();
 
-    // TP/SL on weighted avg
-    if (params.direction === 'BUY' && new Decimal(state.baseHeld).gt(0) && new Decimal(state.avgCost).gt(0)) {
-      const pnlPct = lastPrice.minus(state.avgCost).div(state.avgCost).mul(100).toNumber();
+    // TP/SL on weighted avg (BUY mode only — SELL mode liquidation logic is
+    // symmetric but rarely useful in practice; leaving as-is)
+    if (params.direction === 'BUY' && new Decimal(state.heldBase).gt(0) && new Decimal(state.avgPrice).gt(0)) {
+      const pnlPct = lastPrice.minus(state.avgPrice).div(state.avgPrice).mul(100).toNumber();
       if (params.takeProfitPct && pnlPct >= params.takeProfitPct) {
         await this.liquidate(ctx, state, lastPriceStr, `TP +${pnlPct.toFixed(2)}%`);
         return;
@@ -204,7 +346,7 @@ export class DCAStrategy implements Strategy<DCAParams> {
   }
 
   private async liquidate(ctx: StrategyContext, state: DCAState, lastPriceStr: string, reason: string): Promise<void> {
-    const qty = roundToStepSize(state.baseHeld, ctx.filters.stepSize);
+    const qty = roundToStepSize(state.heldBase, ctx.filters.stepSize);
     if (new Decimal(qty).lte(0)) return;
     const price = roundToTickSize(lastPriceStr, ctx.filters.tickSize);
     const v = validateOrder(ctx.filters, price, qty);

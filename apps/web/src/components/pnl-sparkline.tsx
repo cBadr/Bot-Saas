@@ -154,11 +154,16 @@ export function PnLSparkline({ live }: { live: BotLive }) {
         </div>
 
         {/* Inventory exposure */}
-        {pnl.unmatchedCount > 0 && (
+        {(pnl.heldQty > 0 || pnl.soldQty > 0) && (
           <div className="text-[11px] text-muted-foreground bg-muted/40 rounded px-3 py-2 space-y-1">
             <div>
-              <span className="font-semibold text-foreground">{pnl.unmatchedCount}</span> unmatched fill
-              {pnl.unmatchedCount > 1 ? 's' : ''} — counter orders are open.
+              {pnl.heldQty > 0 && (
+                <span><span className="font-semibold text-foreground">{formatNumber(pnl.heldQty, { maximumFractionDigits: 8 })}</span> held</span>
+              )}
+              {pnl.heldQty > 0 && pnl.soldQty > 0 && <span> · </span>}
+              {pnl.soldQty > 0 && (
+                <span><span className="font-semibold text-foreground">{formatNumber(pnl.soldQty, { maximumFractionDigits: 8 })}</span> sold awaiting BB</span>
+              )}
             </div>
             {live.initialStartPrice && live.marketPrice && (
               <div className="font-mono text-[10px]">
