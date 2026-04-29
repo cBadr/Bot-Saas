@@ -60,12 +60,13 @@ interface DcaSimpleState {
   /** Bot launch timestamp (ms). Used for durationMinutes auto-stop. */
   startedAtMs: number;
   /**
-   * Last time activity was recorded (ms). "Activity" = ladder rung fill or
-   * fresh cycle start. Used for the `recenterAfterMinutes` inactivity timer:
-   * if `now - lastActivityAtMs >= recenterAfterMinutes*60_000` and no cooldown
-   * is active, the bot recenters around the current market.
+   * When the CURRENT cycle's ladder was built (ms). Reset only on cycle start
+   * (init / `_startNewCycle`). NOT bumped on individual fills — once any rung
+   * fills (`fillsThisCycle > 0`), the cycle is considered "active" and the
+   * recenter-from-inactivity timer is disabled regardless of how long it
+   * takes for the next fill (so the cycle runs to completion at its TP/BB).
    */
-  lastActivityAtMs: number;
+  cycleStartedAtMs: number;
   /** Next reconcile timestamp (ms). */
   nextReconcileAtMs: number;
   /** Has the bot already auto-stopped via duration? */
@@ -224,12 +225,15 @@ export class DcaSimpleStrategy implements Strategy<DcaSimpleParams> {
     const reconcileDue = Date.now() >= peek.nextReconcileAtMs;
     const cooldownActive = (peek.cooldownUntilMs ?? 0) > 0 && Date.now() < peek.cooldownUntilMs;
     const cooldownExpired = (peek.cooldownUntilMs ?? 0) > 0 && Date.now() >= peek.cooldownUntilMs;
-    // Recenter from inactivity: ladder exists, no cooldown active, and we
-    // haven't had a fill (or new-cycle reset) for the configured window.
+    // Recenter from inactivity: only triggers when ZERO rungs have filled
+    // in the current cycle and the cycle has been alive longer than the
+    // configured window. Once any fill happens (fillsThisCycle > 0) the
+    // cycle is "active" and runs to natural completion at TP/BB.
     const inactivityDue = params.recenterAfterMinutes > 0
       && !cooldownActive
       && (peek.ladder?.length ?? 0) > 0
-      && Date.now() - (peek.lastActivityAtMs ?? peek.startedAtMs) >= params.recenterAfterMinutes * 60_000;
+      && (peek.fillsThisCycle ?? 0) === 0
+      && Date.now() - (peek.cycleStartedAtMs ?? peek.startedAtMs) >= params.recenterAfterMinutes * 60_000;
     if (!durationDue && !reconcileDue && !cooldownExpired && !inactivityDue) return;
 
     return withBotLock(ctx.botId, async () => {
@@ -268,17 +272,24 @@ export class DcaSimpleStrategy implements Strategy<DcaSimpleParams> {
       }
 
       // ─── Inactivity recenter ───
-      // If the ladder hasn't seen any fill for `recenterAfterMinutes`,
-      // abandon the current cycle. Cancel ladder + (optionally) start the
-      // cooldown timer. The next tick after cooldown will rebuild around
-      // the new market price via the standard cooldown-wakeup path.
+      // ONLY triggers when:
+      //   • recenterAfterMinutes > 0 (feature enabled)
+      //   • a ladder is currently placed
+      //   • not in cooldown
+      //   • ZERO rungs have filled in this cycle (fillsThisCycle === 0)
+      //   • the cycle has been alive longer than the configured window
+      //
+      // Once any rung fills, the cycle is committed and runs to TP/BB
+      // completion regardless of how long the rest takes — only AFTER the
+      // counter closes will the standard cooldown kick in.
       if (
         params.recenterAfterMinutes > 0
         && state.ladder.length > 0
         && (state.cooldownUntilMs ?? 0) === 0
-        && Date.now() - (state.lastActivityAtMs ?? state.startedAtMs) >= params.recenterAfterMinutes * 60_000
+        && (state.fillsThisCycle ?? 0) === 0
+        && Date.now() - (state.cycleStartedAtMs ?? state.startedAtMs) >= params.recenterAfterMinutes * 60_000
       ) {
-        const idleMin = Math.round((Date.now() - state.lastActivityAtMs) / 60_000);
+        const idleMin = Math.round((Date.now() - state.cycleStartedAtMs) / 60_000);
         ctx.logger.info('Inactivity threshold reached — recentering', {
           idleMin, recenterAfterMinutes: params.recenterAfterMinutes,
         });
@@ -366,7 +377,7 @@ export class DcaSimpleStrategy implements Strategy<DcaSimpleParams> {
       realizedPnlQuote: '0',
       cyclesCompleted: 0,
       startedAtMs: Date.now(),
-      lastActivityAtMs: Date.now(),
+      cycleStartedAtMs: Date.now(),
       nextReconcileAtMs: Date.now(),
       autoStopped: false,
       cooldownUntilMs: 0,
@@ -392,7 +403,12 @@ export class DcaSimpleStrategy implements Strategy<DcaSimpleParams> {
     if (typeof s.avgPrice !== 'string') s.avgPrice = '0';
     if (typeof s.fillsThisCycle !== 'number') s.fillsThisCycle = 0;
     if (typeof s.cooldownUntilMs !== 'number') s.cooldownUntilMs = 0;
-    if (typeof s.lastActivityAtMs !== 'number') s.lastActivityAtMs = s.startedAtMs ?? Date.now();
+    if (typeof s.cycleStartedAtMs !== 'number') {
+      // Migrate from older `lastActivityAtMs` field if present, else fall back
+      // to bot start time so existing running bots don't immediately recenter.
+      const legacy = (s as unknown as { lastActivityAtMs?: number }).lastActivityAtMs;
+      s.cycleStartedAtMs = typeof legacy === 'number' ? legacy : (s.startedAtMs ?? Date.now());
+    }
   }
 
   /**
@@ -658,7 +674,11 @@ export class DcaSimpleStrategy implements Strategy<DcaSimpleParams> {
       ? new Decimal(state.openCostBasis).div(heldDecimal).toString()
       : '0';
     state.fillsThisCycle += 1;
-    state.lastActivityAtMs = Date.now(); // reset inactivity timer on every fill
+    // NOTE: We deliberately do NOT bump cycleStartedAtMs here. Once any fill
+    // happens (fillsThisCycle > 0), the recenter-from-inactivity timer is
+    // disabled — see the inactivity check in onTick. This lets the cycle run
+    // to its natural completion at the TP/BB, regardless of how long the
+    // remaining rungs take to fill.
 
     await ctx.emit(`DCA_${filled.side}_FILLED`,
       `${filled.side} #${filled.index} @ ${event.price} → fills=${state.fillsThisCycle}, avg=${new Decimal(state.avgPrice).toFixed(8)}`,
@@ -743,7 +763,7 @@ export class DcaSimpleStrategy implements Strategy<DcaSimpleParams> {
     ctx: StrategyContext, params: DcaSimpleParams, state: DcaSimpleState,
   ): Promise<void> {
     state.cooldownUntilMs = 0;
-    state.lastActivityAtMs = Date.now(); // reset inactivity timer for the new cycle
+    state.cycleStartedAtMs = Date.now(); // start the inactivity timer for the new cycle
     try {
       const ticker = await ctx.client.getTickerPrice(ctx.symbol);
       state.cycleAnchorPrice = roundToTickSize(ticker.price, ctx.filters.tickSize);
