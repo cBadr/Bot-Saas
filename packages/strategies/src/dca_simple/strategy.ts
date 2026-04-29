@@ -59,10 +59,24 @@ interface DcaSimpleState {
   cyclesCompleted: number;
   /** Bot launch timestamp (ms). Used for durationMinutes auto-stop. */
   startedAtMs: number;
+  /**
+   * Last time activity was recorded (ms). "Activity" = ladder rung fill or
+   * fresh cycle start. Used for the `recenterAfterMinutes` inactivity timer:
+   * if `now - lastActivityAtMs >= recenterAfterMinutes*60_000` and no cooldown
+   * is active, the bot recenters around the current market.
+   */
+  lastActivityAtMs: number;
   /** Next reconcile timestamp (ms). */
   nextReconcileAtMs: number;
   /** Has the bot already auto-stopped via duration? */
   autoStopped: boolean;
+  /**
+   * Unix ms after which the next cycle should start (rebuild ladder).
+   * Set when a counter fills if `cooldownMinutes > 0`. While this is
+   * in the future, the bot is idle (no ladder, no orders).
+   * 0 / undefined = no cooldown pending → rebuild immediately on counter fill.
+   */
+  cooldownUntilMs: number;
   /** FIFO of clientOrderIds already processed for FILLED — dedup across WS/poller/reconcile. */
   processedFills: string[];
 }
@@ -208,12 +222,22 @@ export class DcaSimpleStrategy implements Strategy<DcaSimpleParams> {
     const durationDue = params.durationMinutes > 0 && !peek.autoStopped &&
       Date.now() - peek.startedAtMs >= params.durationMinutes * 60_000;
     const reconcileDue = Date.now() >= peek.nextReconcileAtMs;
-    if (!durationDue && !reconcileDue) return;
+    const cooldownActive = (peek.cooldownUntilMs ?? 0) > 0 && Date.now() < peek.cooldownUntilMs;
+    const cooldownExpired = (peek.cooldownUntilMs ?? 0) > 0 && Date.now() >= peek.cooldownUntilMs;
+    // Recenter from inactivity: ladder exists, no cooldown active, and we
+    // haven't had a fill (or new-cycle reset) for the configured window.
+    const inactivityDue = params.recenterAfterMinutes > 0
+      && !cooldownActive
+      && (peek.ladder?.length ?? 0) > 0
+      && Date.now() - (peek.lastActivityAtMs ?? peek.startedAtMs) >= params.recenterAfterMinutes * 60_000;
+    if (!durationDue && !reconcileDue && !cooldownExpired && !inactivityDue) return;
 
     return withBotLock(ctx.botId, async () => {
       const state = await ctx.loadState<DcaSimpleState>();
       if (!state) return;
+      this._migrateState(state);
 
+      // Duration auto-stop
       if (params.durationMinutes > 0 && !state.autoStopped &&
           Date.now() - state.startedAtMs >= params.durationMinutes * 60_000) {
         state.autoStopped = true;
@@ -224,6 +248,66 @@ export class DcaSimpleStrategy implements Strategy<DcaSimpleParams> {
         return;
       }
 
+      // ─── Cooldown wakeup ───
+      // If we're past the cooldown deadline and haven't rebuilt yet
+      // (state.ladder is empty), build the next cycle now.
+      if ((state.cooldownUntilMs ?? 0) > 0 && Date.now() >= state.cooldownUntilMs) {
+        await ctx.emit('DCA_COOLDOWN_ENDED',
+          `Cooldown ended — starting cycle #${state.cyclesCompleted + 1}`);
+        await this._startNewCycle(ctx, params, state);
+        await ctx.saveState(state);
+        return; // skip reconcile this tick — fresh state
+      }
+
+      // Skip reconcile while cooldown is still active (no orders to manage).
+      if ((state.cooldownUntilMs ?? 0) > 0 && Date.now() < state.cooldownUntilMs) {
+        // Touch the next reconcile timestamp so it doesn't pile up.
+        state.nextReconcileAtMs = Math.max(state.nextReconcileAtMs, state.cooldownUntilMs);
+        await ctx.saveState(state);
+        return;
+      }
+
+      // ─── Inactivity recenter ───
+      // If the ladder hasn't seen any fill for `recenterAfterMinutes`,
+      // abandon the current cycle. Cancel ladder + (optionally) start the
+      // cooldown timer. The next tick after cooldown will rebuild around
+      // the new market price via the standard cooldown-wakeup path.
+      if (
+        params.recenterAfterMinutes > 0
+        && state.ladder.length > 0
+        && (state.cooldownUntilMs ?? 0) === 0
+        && Date.now() - (state.lastActivityAtMs ?? state.startedAtMs) >= params.recenterAfterMinutes * 60_000
+      ) {
+        const idleMin = Math.round((Date.now() - state.lastActivityAtMs) / 60_000);
+        ctx.logger.info('Inactivity threshold reached — recentering', {
+          idleMin, recenterAfterMinutes: params.recenterAfterMinutes,
+        });
+        await this._cancelLadder(ctx, state);
+        // Reset cycle position (no fills happened, but be defensive).
+        state.heldBase = '0';
+        state.openCostBasis = '0';
+        state.avgPrice = '0';
+        state.fillsThisCycle = 0;
+        state.counter = null;
+
+        if (params.cooldownMinutes > 0) {
+          state.cooldownUntilMs = Date.now() + params.cooldownMinutes * 60_000;
+          await ctx.emit('DCA_RECENTER_INACTIVITY',
+            `No fills for ${idleMin}min ≥ ${params.recenterAfterMinutes}min → ladder cancelled, cooling down ${params.cooldownMinutes}min`,
+            { idleMin, recenterAfterMinutes: params.recenterAfterMinutes,
+              cooldownMinutes: params.cooldownMinutes,
+              cooldownUntilMs: state.cooldownUntilMs });
+        } else {
+          await ctx.emit('DCA_RECENTER_INACTIVITY',
+            `No fills for ${idleMin}min ≥ ${params.recenterAfterMinutes}min → recentering immediately`,
+            { idleMin, recenterAfterMinutes: params.recenterAfterMinutes });
+          await this._startNewCycle(ctx, params, state);
+        }
+        await ctx.saveState(state);
+        return;
+      }
+
+      // Normal reconcile
       if (Date.now() >= state.nextReconcileAtMs) {
         state.nextReconcileAtMs = Date.now() + RECONCILE_EVERY_MS;
         await ctx.saveState(state);
@@ -282,8 +366,10 @@ export class DcaSimpleStrategy implements Strategy<DcaSimpleParams> {
       realizedPnlQuote: '0',
       cyclesCompleted: 0,
       startedAtMs: Date.now(),
+      lastActivityAtMs: Date.now(),
       nextReconcileAtMs: Date.now(),
       autoStopped: false,
+      cooldownUntilMs: 0,
       processedFills: [],
     };
 
@@ -305,6 +391,56 @@ export class DcaSimpleStrategy implements Strategy<DcaSimpleParams> {
     if (typeof s.openCostBasis !== 'string') s.openCostBasis = '0';
     if (typeof s.avgPrice !== 'string') s.avgPrice = '0';
     if (typeof s.fillsThisCycle !== 'number') s.fillsThisCycle = 0;
+    if (typeof s.cooldownUntilMs !== 'number') s.cooldownUntilMs = 0;
+    if (typeof s.lastActivityAtMs !== 'number') s.lastActivityAtMs = s.startedAtMs ?? Date.now();
+  }
+
+  /**
+   * Compute the offset and order size for a given ladder rung index (1-based)
+   * based on the multiplier mode/value.
+   *
+   *   priceMode=flat     → offset = baseSpread × i
+   *   priceMode=percent  → gap_k = baseSpread × (1 + p/100)^(k-1); offset = Σ_{k=1..i} gap_k
+   *   priceMode=dollar   → gap_k = baseSpread + p × (k-1);          offset = Σ_{k=1..i} gap_k
+   *   sizeMode similar but applied to orderSize.
+   */
+  private _rungSpec(params: DcaSimpleParams, i: number): { offset: Decimal; sizeQuote: Decimal } {
+    const baseSpread = new Decimal(params.gridSpread);
+    const baseSize = new Decimal(params.orderSize);
+
+    // ─── Price gap progression ───
+    let offset: Decimal;
+    if (params.priceMultiplierMode === 'percent') {
+      const r = new Decimal(1).plus(new Decimal(params.priceMultiplier).div(100));
+      // Σ_{k=0..i-1} baseSpread × r^k = baseSpread × (r^i − 1) / (r − 1)
+      if (r.eq(1)) {
+        offset = baseSpread.mul(i);
+      } else {
+        offset = baseSpread.mul(r.pow(i).minus(1)).div(r.minus(1));
+      }
+    } else if (params.priceMultiplierMode === 'dollar') {
+      const d = new Decimal(params.priceMultiplier);
+      // Σ_{k=0..i-1} (baseSpread + d×k) = i×baseSpread + d × (i×(i-1)/2)
+      offset = baseSpread.mul(i).plus(d.mul(i).mul(i - 1).div(2));
+    } else {
+      // flat
+      offset = baseSpread.mul(i);
+    }
+
+    // ─── Size progression ───
+    let sizeQuote: Decimal;
+    const k = i - 1; // 0-based for size growth
+    if (params.sizeMultiplierMode === 'percent') {
+      const r = new Decimal(1).plus(new Decimal(params.sizeMultiplier).div(100));
+      sizeQuote = baseSize.mul(r.pow(k));
+    } else if (params.sizeMultiplierMode === 'dollar') {
+      sizeQuote = baseSize.plus(new Decimal(params.sizeMultiplier).mul(k));
+    } else {
+      sizeQuote = baseSize;
+    }
+    if (sizeQuote.lte(0)) sizeQuote = baseSize; // safety
+
+    return { offset, sizeQuote };
   }
 
   // ═══ Ladder construction ═════════════════════════════════════════════
@@ -317,19 +453,18 @@ export class DcaSimpleStrategy implements Strategy<DcaSimpleParams> {
    */
   private async _buildLadder(ctx: StrategyContext, params: DcaSimpleParams, state: DcaSimpleState): Promise<void> {
     const anchor = new Decimal(state.cycleAnchorPrice);
-    const spread = new Decimal(params.gridSpread);
     const ladderSide: 'BUY' | 'SELL' = params.direction;
     const orders: DcaOrder[] = [];
 
     for (let i = 1; i <= params.gridLevels; i++) {
-      const offset = spread.mul(i);
+      const { offset, sizeQuote } = this._rungSpec(params, i);
       const rawPrice = ladderSide === 'BUY' ? anchor.minus(offset) : anchor.plus(offset);
       if (rawPrice.lte(0)) {
         ctx.logger.warn('Skipping ladder rung — price would be ≤0', { i, rawPrice: rawPrice.toString() });
         continue;
       }
       const price = roundToTickSize(rawPrice, ctx.filters.tickSize);
-      const qty = roundToStepSize(new Decimal(params.orderSize).div(price), ctx.filters.stepSize);
+      const qty = roundToStepSize(sizeQuote.div(price), ctx.filters.stepSize);
       const v = validateOrder(ctx.filters, price, qty);
       if (!v.ok) {
         ctx.logger.warn(`Skipping invalid ${ladderSide} rung`, { i, price, qty, reason: v.reason });
@@ -523,6 +658,7 @@ export class DcaSimpleStrategy implements Strategy<DcaSimpleParams> {
       ? new Decimal(state.openCostBasis).div(heldDecimal).toString()
       : '0';
     state.fillsThisCycle += 1;
+    state.lastActivityAtMs = Date.now(); // reset inactivity timer on every fill
 
     await ctx.emit(`DCA_${filled.side}_FILLED`,
       `${filled.side} #${filled.index} @ ${event.price} → fills=${state.fillsThisCycle}, avg=${new Decimal(state.avgPrice).toFixed(8)}`,
@@ -578,20 +714,42 @@ export class DcaSimpleStrategy implements Strategy<DcaSimpleParams> {
     // market that didn't get hit during this cycle).
     await this._cancelLadder(ctx, state);
 
-    // Reset position and rebuild a fresh ladder around current market.
+    // Reset position
     state.heldBase = '0';
     state.openCostBasis = '0';
     state.avgPrice = '0';
     state.fillsThisCycle = 0;
 
+    // ─── Cooldown gating ───
+    // If user configured a cooldown, set the wakeup timestamp and DON'T
+    // rebuild the ladder yet. onTick will pick it up when the time elapses.
+    // Otherwise, rebuild immediately around the current market price.
+    if (params.cooldownMinutes > 0) {
+      state.cooldownUntilMs = Date.now() + params.cooldownMinutes * 60_000;
+      await ctx.emit('DCA_COOLDOWN_STARTED',
+        `Cycle #${state.cyclesCompleted} closed → cooling down for ${params.cooldownMinutes}min`,
+        { cooldownUntilMs: state.cooldownUntilMs, cooldownMinutes: params.cooldownMinutes });
+    } else {
+      await this._startNewCycle(ctx, params, state);
+    }
+  }
+
+  /**
+   * Build a fresh ladder around the current market price for the next cycle.
+   * Called either immediately after a counter fill (no cooldown) or by onTick
+   * once cooldownUntilMs elapses.
+   */
+  private async _startNewCycle(
+    ctx: StrategyContext, params: DcaSimpleParams, state: DcaSimpleState,
+  ): Promise<void> {
+    state.cooldownUntilMs = 0;
+    state.lastActivityAtMs = Date.now(); // reset inactivity timer for the new cycle
     try {
       const ticker = await ctx.client.getTickerPrice(ctx.symbol);
       state.cycleAnchorPrice = roundToTickSize(ticker.price, ctx.filters.tickSize);
     } catch (err) {
-      ctx.logger.warn('Failed to fetch ticker for cycle rebuild — using last fill price', { err: String(err) });
-      state.cycleAnchorPrice = event.price;
+      ctx.logger.warn('Failed to fetch ticker for cycle rebuild — using existing anchor', { err: String(err) });
     }
-
     await this._buildLadder(ctx, params, state);
     await ctx.emit('DCA_CYCLE_REBUILT',
       `Cycle #${state.cyclesCompleted + 1} ladder rebuilt around ${state.cycleAnchorPrice}`,

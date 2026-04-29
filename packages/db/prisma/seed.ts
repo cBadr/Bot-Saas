@@ -180,6 +180,12 @@ async function main() {
           gridSpread: { type: 'number', exclusiveMinimum: 0 },
           orderSize: { type: 'number', exclusiveMinimum: 0 },
           takeProfit: { type: 'number', exclusiveMinimum: 0 },
+          priceMultiplierMode: { type: 'string', enum: ['flat', 'percent', 'dollar'], default: 'flat' },
+          priceMultiplier: { type: 'number', minimum: 0, default: 0 },
+          sizeMultiplierMode: { type: 'string', enum: ['flat', 'percent', 'dollar'], default: 'flat' },
+          sizeMultiplier: { type: 'number', minimum: 0, default: 0 },
+          cooldownMinutes: { type: 'integer', minimum: 0, default: 0 },
+          recenterAfterMinutes: { type: 'integer', minimum: 0, default: 0 },
           durationMinutes: { type: 'integer', minimum: 0, default: 0 },
           customStartPrice: { type: 'number', exclusiveMinimum: 0 },
         },
@@ -187,7 +193,7 @@ async function main() {
     },
     update: {
       description:
-        'Ladder DCA with single dynamic TP/BB. Places N LIMIT_MAKER orders descending (BUY) or ascending (SELL); maintains one counter at avg±takeProfit; on counter fill, realizes PnL and rebuilds ladder around new market.',
+        'Ladder DCA with single dynamic TP/BB. Places N LIMIT_MAKER orders descending (BUY) or ascending (SELL); maintains one counter at avg±takeProfit; on counter fill, realizes PnL and rebuilds ladder around new market. Supports percent/dollar multipliers on price gap and order size, plus optional cooldown between cycles.',
     },
   });
   console.log('  ✓ Built-in DCA Simple strategy');

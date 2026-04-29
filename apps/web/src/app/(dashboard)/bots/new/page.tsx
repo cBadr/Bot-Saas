@@ -67,6 +67,12 @@ interface FormData {
   dsGridSpread?: number;
   dsOrderSize?: number;
   dsTakeProfit?: number;
+  dsPriceMultiplierMode?: 'flat' | 'percent' | 'dollar';
+  dsPriceMultiplier?: number;
+  dsSizeMultiplierMode?: 'flat' | 'percent' | 'dollar';
+  dsSizeMultiplier?: number;
+  dsCooldownMinutes?: number;
+  dsRecenterAfterMinutes?: number;
   dsDurationMinutes?: number;
   dsUseCustomStartPrice?: boolean;
   dsCustomStartPrice?: number;
@@ -115,6 +121,12 @@ export default function NewBotPage() {
       dsGridSpread: 10,
       dsOrderSize: 10,
       dsTakeProfit: 50,
+      dsPriceMultiplierMode: 'flat',
+      dsPriceMultiplier: 0,
+      dsSizeMultiplierMode: 'flat',
+      dsSizeMultiplier: 0,
+      dsCooldownMinutes: 0,
+      dsRecenterAfterMinutes: 0,
       dsDurationMinutes: 0,
       dsUseCustomStartPrice: false,
       cooldownSec: 60,
@@ -248,6 +260,12 @@ export default function NewBotPage() {
       params.gridSpread = Number(data.dsGridSpread);
       params.orderSize = Number(data.dsOrderSize);
       params.takeProfit = Number(data.dsTakeProfit);
+      params.priceMultiplierMode = data.dsPriceMultiplierMode ?? 'flat';
+      params.priceMultiplier = Number(data.dsPriceMultiplier ?? 0);
+      params.sizeMultiplierMode = data.dsSizeMultiplierMode ?? 'flat';
+      params.sizeMultiplier = Number(data.dsSizeMultiplier ?? 0);
+      params.cooldownMinutes = Number(data.dsCooldownMinutes ?? 0);
+      params.recenterAfterMinutes = Number(data.dsRecenterAfterMinutes ?? 0);
       params.durationMinutes = Number(data.dsDurationMinutes ?? 0);
       if (data.dsUseCustomStartPrice && data.dsCustomStartPrice) {
         params.customStartPrice = Number(data.dsCustomStartPrice);
@@ -680,6 +698,108 @@ export default function NewBotPage() {
                   </Field>
                 </div>
 
+                {/* ─── Multipliers (martingale-style progression) ─── */}
+                <details className="rounded-md border bg-accent/10 p-3 group">
+                  <summary className="cursor-pointer list-none flex items-center justify-between text-sm font-medium select-none">
+                    <span>Advanced — Multipliers</span>
+                    <span className="text-xs text-muted-foreground group-open:hidden">Show</span>
+                    <span className="text-xs text-muted-foreground hidden group-open:inline">Hide</span>
+                  </summary>
+                  <div className="mt-3 space-y-3">
+                    <p className="text-xs text-muted-foreground">
+                      Make later ladder rungs use bigger price gaps and / or bigger order sizes.
+                      Set mode to <code className="px-1 bg-muted rounded">flat</code> for the
+                      default constant ladder.
+                    </p>
+
+                    {/* Price multiplier */}
+                    <div className="grid grid-cols-2 gap-3">
+                      <Field label="Price gap multiplier" hint="How the spread between adjacent rungs grows.">
+                        <select
+                          className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                          {...register('dsPriceMultiplierMode')}
+                        >
+                          <option value="flat">Flat — constant</option>
+                          <option value="percent">Percent (%) — geometric</option>
+                          <option value="dollar">Dollar ($) — arithmetic</option>
+                        </select>
+                      </Field>
+                      <Field
+                        label={
+                          w.dsPriceMultiplierMode === 'percent' ? 'Growth (%)'
+                            : w.dsPriceMultiplierMode === 'dollar' ? 'Growth ($)'
+                              : 'Growth value'
+                        }
+                        hint={
+                          w.dsPriceMultiplierMode === 'percent'
+                            ? 'e.g. 10 → each gap is 10% bigger than previous.'
+                            : w.dsPriceMultiplierMode === 'dollar'
+                              ? 'e.g. 5 → each gap grows by $5.'
+                              : 'Disabled (flat mode).'
+                        }
+                      >
+                        <Input
+                          type="number" step="any" min={0}
+                          disabled={w.dsPriceMultiplierMode === 'flat'}
+                          {...register('dsPriceMultiplier', { valueAsNumber: true })}
+                        />
+                      </Field>
+                    </div>
+
+                    {/* Size multiplier */}
+                    <div className="grid grid-cols-2 gap-3">
+                      <Field label="Order size multiplier" hint="How order size grows per rung (martingale).">
+                        <select
+                          className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                          {...register('dsSizeMultiplierMode')}
+                        >
+                          <option value="flat">Flat — constant</option>
+                          <option value="percent">Percent (%) — geometric</option>
+                          <option value="dollar">Dollar ($) — arithmetic</option>
+                        </select>
+                      </Field>
+                      <Field
+                        label={
+                          w.dsSizeMultiplierMode === 'percent' ? 'Growth (%)'
+                            : w.dsSizeMultiplierMode === 'dollar' ? 'Growth ($)'
+                              : 'Growth value'
+                        }
+                        hint={
+                          w.dsSizeMultiplierMode === 'percent'
+                            ? 'e.g. 20 → each order is 20% bigger than previous.'
+                            : w.dsSizeMultiplierMode === 'dollar'
+                              ? 'e.g. 2 → each order grows by $2.'
+                              : 'Disabled (flat mode).'
+                        }
+                      >
+                        <Input
+                          type="number" step="any" min={0}
+                          disabled={w.dsSizeMultiplierMode === 'flat'}
+                          {...register('dsSizeMultiplier', { valueAsNumber: true })}
+                        />
+                      </Field>
+                    </div>
+                  </div>
+                </details>
+
+                {/* ─── Cooldown + Recenter (cycle lifecycle controls) ─── */}
+                <div className="grid grid-cols-2 gap-4">
+                  <Field
+                    label="Cooldown after cycle (min)"
+                    hint="When the counter (TP/BB) fills, idle for this many minutes before rebuilding. 0 = rebuild immediately."
+                  >
+                    <Input type="number" min={0}
+                      {...register('dsCooldownMinutes', { valueAsNumber: true })} />
+                  </Field>
+                  <Field
+                    label="Recenter after inactivity (min)"
+                    hint="If NO ladder rung fills for this many minutes (price drifted), abort the cycle, run cooldown, then rebuild around the new market. 0 = disabled."
+                  >
+                    <Input type="number" min={0}
+                      {...register('dsRecenterAfterMinutes', { valueAsNumber: true })} />
+                  </Field>
+                </div>
+
                 {/* Duration */}
                 <Field label="Duration (minutes)" hint="0 = run until you stop it.">
                   <Input type="number" min={0}
@@ -706,23 +826,18 @@ export default function NewBotPage() {
                   )}
                 </div>
 
-                {/* Capital summary */}
+                {/* Capital summary — uses the SAME multiplier math as the strategy */}
                 {(() => {
-                  const N = Number(w.dsGridLevels);
-                  const sz = Number(w.dsOrderSize);
-                  const sp = Number(w.dsGridSpread);
+                  const levels = previewLevels.filter((l) => l.side === w.dsDirection);
+                  if (levels.length === 0 || !marketPrice) return null;
+                  const totalCapital = levels.reduce((s, l) => s + l.quoteAmount, 0);
+                  const totalQty = levels.reduce((s, l) => s + l.baseQty, 0);
                   const tp = Number(w.dsTakeProfit);
-                  const dir = w.dsDirection ?? 'BUY';
-                  if (!Number.isFinite(N) || !Number.isFinite(sz) || N < 1 || sz <= 0) return null;
-                  const totalCapital = N * sz;
-                  const profitPerCycle = (Number.isFinite(tp) && tp > 0 && marketPrice)
-                    ? tp * (totalCapital / marketPrice)
-                    : 0;
-                  const ladderRange = (Number.isFinite(sp) && sp > 0 && marketPrice)
-                    ? dir === 'BUY'
-                      ? `${(marketPrice - sp).toFixed(2)} → ${(marketPrice - sp * N).toFixed(2)}`
-                      : `${(marketPrice + sp).toFixed(2)} → ${(marketPrice + sp * N).toFixed(2)}`
-                    : '—';
+                  const profitPerCycle = (Number.isFinite(tp) && tp > 0) ? tp * totalQty : 0;
+                  const firstPrice = levels[0]!.price;
+                  const lastPrice = levels[levels.length - 1]!.price;
+                  const ladderRange = `${firstPrice.toLocaleString(undefined, { maximumFractionDigits: 2 })} → ${lastPrice.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+                  const cd = Number(w.dsCooldownMinutes ?? 0);
                   return (
                     <div className="rounded border bg-muted/30 px-3 py-2 text-xs space-y-1 font-mono">
                       <div className="flex justify-between">
@@ -739,6 +854,12 @@ export default function NewBotPage() {
                           ~${profitPerCycle.toFixed(4)}
                         </span>
                       </div>
+                      {cd > 0 && (
+                        <div className="flex justify-between">
+                          <span className="text-muted-foreground">Cooldown after each cycle:</span>
+                          <span className="font-semibold text-primary">{cd}m</span>
+                        </div>
+                      )}
                     </div>
                   );
                 })()}
@@ -1026,32 +1147,56 @@ function buildGridSimplePreview(w: FormData, marketPrice?: number): PreviewLevel
 
 function buildDcaSimplePreview(w: FormData, marketPrice?: number): PreviewLevel[] {
   const N = Number(w.dsGridLevels);
-  const spread = Number(w.dsGridSpread);
-  const orderSize = Number(w.dsOrderSize);
+  const baseSpread = Number(w.dsGridSpread);
+  const baseSize = Number(w.dsOrderSize);
   const tp = Number(w.dsTakeProfit);
   const dir = w.dsDirection ?? 'BUY';
+  const priceMode = w.dsPriceMultiplierMode ?? 'flat';
+  const priceMult = Number(w.dsPriceMultiplier ?? 0);
+  const sizeMode = w.dsSizeMultiplierMode ?? 'flat';
+  const sizeMult = Number(w.dsSizeMultiplier ?? 0);
+
   const start = w.dsUseCustomStartPrice && w.dsCustomStartPrice
     ? Number(w.dsCustomStartPrice)
     : marketPrice;
   if (!start || !Number.isFinite(N) || N < 1
-      || !Number.isFinite(spread) || spread <= 0
-      || !Number.isFinite(orderSize) || orderSize <= 0) return [];
+      || !Number.isFinite(baseSpread) || baseSpread <= 0
+      || !Number.isFinite(baseSize) || baseSize <= 0) return [];
+
+  // Mirror strategy._rungSpec so the preview matches what the bot will place.
+  const rungSpec = (i: number): { offset: number; sizeQuote: number } => {
+    let offset: number;
+    if (priceMode === 'percent') {
+      const r = 1 + priceMult / 100;
+      offset = r === 1 ? baseSpread * i : baseSpread * (Math.pow(r, i) - 1) / (r - 1);
+    } else if (priceMode === 'dollar') {
+      offset = i * baseSpread + priceMult * i * (i - 1) / 2;
+    } else {
+      offset = baseSpread * i;
+    }
+    let sizeQuote: number;
+    const k = i - 1;
+    if (sizeMode === 'percent') sizeQuote = baseSize * Math.pow(1 + sizeMult / 100, k);
+    else if (sizeMode === 'dollar') sizeQuote = baseSize + sizeMult * k;
+    else sizeQuote = baseSize;
+    if (sizeQuote <= 0) sizeQuote = baseSize;
+    return { offset, sizeQuote };
+  };
 
   const out: PreviewLevel[] = [];
   for (let i = 1; i <= N; i++) {
-    const offset = i * spread;
+    const { offset, sizeQuote } = rungSpec(i);
     const price = dir === 'BUY' ? start - offset : start + offset;
     if (price <= 0) continue;
     out.push({
       index: dir === 'BUY' ? -i : i,
       price,
-      quoteAmount: orderSize,
-      baseQty: orderSize / price,
+      quoteAmount: sizeQuote,
+      baseQty: sizeQuote / price,
       side: dir,
     });
   }
-  // Approximate counter (TP/BB) marker at the *expected* avg + tp:
-  // After filling all N rungs, avg = (Σ price_i × qty_i) / Σ qty_i.
+  // Counter (TP/BB) marker at the *expected* avg ± tp after filling all rungs.
   if (Number.isFinite(tp) && tp > 0 && out.length > 0) {
     const totalQty = out.reduce((s, l) => s + l.baseQty, 0);
     const totalQuote = out.reduce((s, l) => s + l.quoteAmount, 0);

@@ -210,6 +210,7 @@ export class BotsService {
       heldBase?: string;
       avgPrice?: string;
       ordersExecuted?: number;
+      cooldownUntilMs?: number;
       // ─ Common ─
       realizedPnlQuote?: string;
       cyclesCompleted?: number;
@@ -381,6 +382,13 @@ export class BotsService {
         totalQuote: totalVolume,
         tradeCount: volumeAgg._count,
       },
+      // Cooldown status (DCA Simple only — null for other strategies).
+      cooldown: state.cooldownUntilMs && state.cooldownUntilMs > Date.now()
+        ? {
+            untilMs: state.cooldownUntilMs,
+            secondsRemaining: Math.max(0, Math.round((state.cooldownUntilMs - Date.now()) / 1000)),
+          }
+        : null,
     };
   }
 

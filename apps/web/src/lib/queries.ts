@@ -122,7 +122,7 @@ export interface Bot {
   totalTrades: number; realizedPnlQuote: string;
   startedAt: string | null; createdAt: string;
   params?: Record<string, unknown>;
-  strategy?: { id: string; name: string; type: string };
+  strategy?: { id: string; name: string; type: string; builtinKey?: string | null };
   apiKey?: { id: string; label: string; status: string };
   /** Server-derived live stats (only present on list/detail responses). */
   liveStats?: BotLiveStats;
@@ -205,6 +205,8 @@ export interface BotLive {
     totalQuote: number;
     tradeCount: number;
   };
+  /** Active cooldown info (DCA Simple only — null otherwise). */
+  cooldown: { untilMs: number; secondsRemaining: number } | null;
 }
 
 export const useBotLive = (id: string) =>

@@ -44,8 +44,18 @@ export function IntegrityWidget({ live }: { live: BotLive }) {
     ? Math.max(0, Math.round((integrity.nextReconcileAtMs - now) / 1000))
     : null;
 
+  const cooldownSecondsRemaining = live.cooldown
+    ? Math.max(0, Math.round((live.cooldown.untilMs - now) / 1000))
+    : 0;
+  const inCooldown = cooldownSecondsRemaining > 0;
+
   return (
-    <Card className={`shadow-md border-2 ${healthy ? 'border-success/30' : integrity.total > 0 ? 'border-yellow-500/40' : 'border-border'}`}>
+    <Card className={`shadow-md border-2 ${
+      inCooldown ? 'border-blue-500/50'
+      : healthy ? 'border-success/30'
+      : integrity.total > 0 ? 'border-yellow-500/40'
+      : 'border-border'
+    }`}>
       <CardHeader className="pb-3">
         <div className="flex items-center justify-between">
           <CardTitle className="text-base flex items-center gap-2">
@@ -73,6 +83,23 @@ export function IntegrityWidget({ live }: { live: BotLive }) {
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
+        {/* Cooldown banner — DCA Simple between cycles */}
+        {inCooldown && (
+          <div className="rounded-md border-2 border-blue-500/40 bg-blue-500/10 px-3 py-2 text-xs">
+            <div className="flex items-center justify-between mb-1">
+              <span className="font-semibold text-blue-700 dark:text-blue-400 flex items-center gap-1">
+                ❄️ Cooldown active
+              </span>
+              <span className="font-mono font-bold text-blue-700 dark:text-blue-400 tabular-nums">
+                {formatCountdown(cooldownSecondsRemaining)}
+              </span>
+            </div>
+            <div className="text-muted-foreground">
+              Cycle closed — bot is idle. Next cycle starts when this timer hits 0.
+            </div>
+          </div>
+        )}
+
         {/* Big counter */}
         <div className="flex items-baseline gap-3">
           <div className="text-4xl font-bold tabular-nums">
@@ -123,4 +150,14 @@ export function IntegrityWidget({ live }: { live: BotLive }) {
       </CardContent>
     </Card>
   );
+}
+
+function formatCountdown(totalSeconds: number): string {
+  const s = Math.max(0, Math.floor(totalSeconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${h}h ${m}m ${sec}s`;
+  if (m > 0) return `${m}m ${sec}s`;
+  return `${sec}s`;
 }

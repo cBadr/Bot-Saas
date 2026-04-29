@@ -10,6 +10,7 @@ import { LiveTradingChart } from '@/components/live-trading-chart';
 import { IntegrityWidget } from '@/components/integrity-widget';
 import { PnLSparkline } from '@/components/pnl-sparkline';
 import { BotInfoCard } from '@/components/bot-info-card';
+import { BotConfigCard } from '@/components/bot-config-card';
 import { formatDuration, formatNumber, formatRelativeTime } from '@/lib/utils';
 import { ArrowLeft, RefreshCw } from 'lucide-react';
 import { toast } from 'sonner';
@@ -77,11 +78,23 @@ export default function BotDetailPage() {
         <Stat label="Started" value={bot.startedAt ? formatDuration(bot.startedAt) : '—'} />
       </div>
 
-      {/* ─── Live monitoring (only meaningful for grid-style strategies with state) ─── */}
-      {live && live.integrity.total > 0 && (
+      {/* ─── Live monitoring (Grid Simple + DCA Simple) ─── */}
+      {/*
+        Show widgets whenever the bot has been initialized (initialStartPrice
+        present), even during cooldown when integrity.total === 0. This keeps
+        Bot Configuration / cooldown countdown / PnL visible across the bot's
+        full lifecycle, not just while orders are open.
+      */}
+      {live && (live.initialStartPrice || live.integrity.total > 0 || live.pnl.cyclesCompleted > 0 || live.cooldown) && (
         <>
           <LiveTradingChart live={live} />
-          <div className="grid gap-6 lg:grid-cols-3">
+          <div className="grid gap-6 md:grid-cols-2">
+            <BotConfigCard
+              builtinKey={bot.strategy?.builtinKey ?? null}
+              params={bot.params}
+              paperTrading={bot.paperTrading}
+              quoteAsset={bot.quoteAsset}
+            />
             <BotInfoCard
               live={live}
               orderSizeQuote={extractOrderSize(bot)}
