@@ -2,10 +2,21 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api, apiCall, tokenStore } from './api';
 
 // ─── Auth ───
+export type FillFrequency = 'OFF' | 'PER_CYCLE' | 'PER_FILL' | 'CUSTOM';
+
+export interface NotificationConfig {
+  notifyOnBuyFills?: boolean;
+  notifyOnSellFills?: boolean;
+  minFillNotional?: number;
+  minCyclePnl?: number;
+}
+
 export interface User {
   id: string; email: string; fullName?: string | null; avatarUrl?: string | null;
   role: string; status: string; twoFactorEnabled: boolean;
   telegramChatId?: string | null; telegramUsername?: string | null;
+  fillFrequency?: FillFrequency;
+  notificationConfig?: NotificationConfig | null;
   referralCode?: string | null; createdAt: string; lastLoginAt?: string | null;
 }
 
@@ -15,6 +26,27 @@ export const useMe = () =>
     queryFn: () => apiCall<User>(() => api.get('/users/me')),
     enabled: !!tokenStore.access,
     retry: false,
+  });
+
+/** Update profile fields (name, telegramChatId, fillFrequency, etc.). */
+export const useUpdateProfile = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: {
+      fullName?: string;
+      telegramChatId?: string | null;
+      telegramUsername?: string | null;
+      fillFrequency?: FillFrequency;
+      notificationConfig?: NotificationConfig;
+    }) => apiCall<User>(() => api.patch('/users/me', input)),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['me'] }),
+  });
+};
+
+/** Send a test Telegram message to the saved chat ID. */
+export const useTestTelegram = () =>
+  useMutation({
+    mutationFn: () => apiCall<{ ok: true }>(() => api.post('/users/me/telegram/test', {})),
   });
 
 export const useLogin = () =>

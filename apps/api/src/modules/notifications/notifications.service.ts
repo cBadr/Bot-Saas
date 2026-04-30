@@ -4,8 +4,16 @@ import { TelegramService } from './telegram.service';
 
 export type NotificationEvent =
   | 'BOT_STARTED' | 'BOT_STOPPED' | 'BOT_ERROR'
-  | 'ORDER_FILLED' | 'TAKE_PROFIT_HIT' | 'STOP_LOSS_HIT'
+  | 'ORDER_FILLED' | 'CYCLE_COMPLETED'
+  | 'TAKE_PROFIT_HIT' | 'STOP_LOSS_HIT'
   | 'PAYMENT_RECEIVED' | 'SUBSCRIPTION_EXPIRING';
+
+export const ALL_NOTIFICATION_EVENTS: NotificationEvent[] = [
+  'BOT_STARTED', 'BOT_STOPPED', 'BOT_ERROR',
+  'ORDER_FILLED', 'CYCLE_COMPLETED',
+  'TAKE_PROFIT_HIT', 'STOP_LOSS_HIT',
+  'PAYMENT_RECEIVED', 'SUBSCRIPTION_EXPIRING',
+];
 
 @Injectable()
 export class NotificationsService {

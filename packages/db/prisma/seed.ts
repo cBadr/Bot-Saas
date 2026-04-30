@@ -231,7 +231,7 @@ async function main() {
   const adminPassword = process.env.ADMIN_DEFAULT_PASSWORD ?? 'ChangeMe123!';
   const passwordHash = await argon2.hash(adminPassword);
 
-  await prisma.user.upsert({
+  const admin = await prisma.user.upsert({
     where: { email: adminEmail },
     create: {
       email: adminEmail,
@@ -244,6 +244,51 @@ async function main() {
     update: {},
   });
   console.log(`  ✓ Default admin: ${adminEmail}`);
+
+  // ─── Default Notification Preferences for admin ───
+  // IN_APP: ON for everything (high signal-to-noise inbox)
+  // TELEGRAM: ON for important events; OFF for low-signal ones (PAYMENT_RECEIVED stays
+  // ON since it's rare; ORDER_FILLED stays OFF since fillFrequency gates it anyway)
+  const defaultPrefs = [
+    // event,                channel,    enabled
+    ['BOT_STARTED',          'IN_APP',   true],
+    ['BOT_STARTED',          'TELEGRAM', true],
+    ['BOT_STOPPED',          'IN_APP',   true],
+    ['BOT_STOPPED',          'TELEGRAM', true],
+    ['BOT_ERROR',            'IN_APP',   true],
+    ['BOT_ERROR',            'TELEGRAM', true],
+    ['CYCLE_COMPLETED',      'IN_APP',   true],
+    ['CYCLE_COMPLETED',      'TELEGRAM', true],
+    ['ORDER_FILLED',         'IN_APP',   true],
+    ['ORDER_FILLED',         'TELEGRAM', false],   // gated by user.fillFrequency anyway
+    ['TAKE_PROFIT_HIT',      'IN_APP',   true],
+    ['TAKE_PROFIT_HIT',      'TELEGRAM', true],
+    ['STOP_LOSS_HIT',        'IN_APP',   true],
+    ['STOP_LOSS_HIT',        'TELEGRAM', true],
+    ['PAYMENT_RECEIVED',     'IN_APP',   true],
+    ['PAYMENT_RECEIVED',     'TELEGRAM', true],
+    ['SUBSCRIPTION_EXPIRING','IN_APP',   true],
+    ['SUBSCRIPTION_EXPIRING','TELEGRAM', true],
+  ] as const;
+  for (const [eventType, channel, enabled] of defaultPrefs) {
+    await prisma.notificationPreference.upsert({
+      where: {
+        userId_channel_eventType: {
+          userId: admin.id,
+          channel: channel as 'IN_APP' | 'TELEGRAM',
+          eventType,
+        },
+      },
+      create: {
+        userId: admin.id,
+        channel: channel as 'IN_APP' | 'TELEGRAM',
+        eventType,
+        enabled,
+      },
+      update: {}, // never override user-edited prefs on re-seed
+    });
+  }
+  console.log(`  ✓ ${defaultPrefs.length} default notification preferences for admin`);
 
   // ─── Default App Settings ───
   const settings = [

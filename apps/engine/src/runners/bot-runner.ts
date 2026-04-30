@@ -339,6 +339,17 @@ export class BotRunner {
     });
     if (!bot) return;
 
+    // Build ctx early so risk events can flow through ctx.emit() →
+    // BotEvent + Redis Pub/Sub → NotificationDispatcher.
+    const ctx = buildStrategyContext({
+      botId: this.botId,
+      symbol: bot.symbol,
+      filters: this.filters,
+      client: this.client as BinanceClient,
+      logger: this.logger,
+      redis: this.redis,
+    });
+
     // ─── Risk Management checks ─────────────────────────
     const currentPnl = Number(bot.realizedPnlQuote);
     if (currentPnl > this.peakPnl) this.peakPnl = currentPnl;
@@ -348,16 +359,12 @@ export class BotRunner {
       const limit = Number(bot.dailyLossLimit);
       const todayLoss = await this.computeTodayLoss();
       if (todayLoss >= limit) {
-        this.logger.warn('Daily loss limit reached, auto-stopping', {
-          todayLoss, limit,
-        });
-        await prisma.botEvent.create({
-          data: {
-            botId: this.botId,
-            type: 'RISK_DAILY_LOSS',
-            message: `Daily loss limit triggered: lost ${todayLoss.toFixed(4)} >= limit ${limit}`,
-          },
-        });
+        this.logger.warn('Daily loss limit reached, auto-stopping', { todayLoss, limit });
+        await ctx.emit(
+          'RISK_DAILY_LOSS',
+          `Daily loss limit triggered: lost ${todayLoss.toFixed(4)} >= limit ${limit}`,
+          { todayLoss, limit },
+        );
         await this.stop(`Risk: daily loss ${todayLoss.toFixed(4)} >= ${limit}`);
         return;
       }
@@ -370,27 +377,17 @@ export class BotRunner {
         this.logger.warn('Max drawdown reached, auto-stopping', {
           ddPct, limit: Number(bot.maxDrawdownPct),
         });
-        await prisma.botEvent.create({
-          data: {
-            botId: this.botId,
-            type: 'RISK_MAX_DRAWDOWN',
-            message: `Drawdown ${ddPct.toFixed(2)}% >= limit ${bot.maxDrawdownPct}%`,
-          },
-        });
+        await ctx.emit(
+          'RISK_MAX_DRAWDOWN',
+          `Drawdown ${ddPct.toFixed(2)}% >= limit ${bot.maxDrawdownPct}%`,
+          { ddPct, limit: Number(bot.maxDrawdownPct), peak: this.peakPnl },
+        );
         await this.stop(`Risk: drawdown ${ddPct.toFixed(2)}%`);
         return;
       }
     }
 
     const ticker = await this.client.getTickerPrice(bot.symbol);
-    const ctx = buildStrategyContext({
-      botId: this.botId,
-      symbol: bot.symbol,
-      filters: this.filters,
-      client: this.client as BinanceClient,
-      logger: this.logger,
-      redis: this.redis,
-    });
     await this.strategy.onTick(ctx, this.params, ticker.price);
   }
 

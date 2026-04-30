@@ -5,11 +5,20 @@ import { CurrentUser, type CurrentUserPayload } from '../../common/decorators/cu
 import { ZodValidationPipe } from '../../common/pipes/zod.pipe';
 import { UsersService } from './users.service';
 
+const NotificationConfigDto = z.object({
+  notifyOnBuyFills: z.boolean().optional(),
+  notifyOnSellFills: z.boolean().optional(),
+  minFillNotional: z.coerce.number().min(0).optional(),
+  minCyclePnl: z.coerce.number().min(0).optional(),
+}).strict();
+
 const UpdateProfileDto = z.object({
   fullName: z.string().min(2).max(100).optional(),
   avatarUrl: z.string().url().optional(),
-  telegramChatId: z.string().optional(),
-  telegramUsername: z.string().optional(),
+  telegramChatId: z.string().nullable().optional(),
+  telegramUsername: z.string().nullable().optional(),
+  fillFrequency: z.enum(['OFF', 'PER_CYCLE', 'PER_FILL', 'CUSTOM']).optional(),
+  notificationConfig: NotificationConfigDto.optional(),
 });
 type UpdateProfileDto = z.infer<typeof UpdateProfileDto>;
 
@@ -58,5 +67,14 @@ export class UsersController {
     @Body(new ZodValidationPipe(z.object({ code: z.string().length(6) }))) dto: { code: string },
   ) {
     return this.users.disable2FA(u.sub, dto.code);
+  }
+
+  /**
+   * Send a test Telegram message to the current user's saved chatId.
+   * Useful for verifying their Telegram setup before relying on it.
+   */
+  @Post('me/telegram/test')
+  testTelegram(@CurrentUser() u: CurrentUserPayload) {
+    return this.users.sendTestTelegram(u.sub);
   }
 }

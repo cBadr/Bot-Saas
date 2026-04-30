@@ -147,6 +147,22 @@ model User {
   telegramChatId  String?
   telegramUsername String?
 
+  // Notification preferences for high-frequency events:
+  //   OFF        — never notify on individual fills
+  //   PER_CYCLE  — only notify when a complete BUY↔SELL cycle closes (default)
+  //   PER_FILL   — notify on every single ladder/grid fill (verbose)
+  //   CUSTOM     — apply user-defined rules in `notificationConfig`
+  fillFrequency   String  @default("PER_CYCLE")
+  /**
+   * Free-form JSON for advanced notification rules. Applied only when
+   * `fillFrequency = 'CUSTOM'`. Recognized keys:
+   *   notifyOnBuyFills?:  boolean (default true)
+   *   notifyOnSellFills?: boolean (default true)
+   *   minFillNotional?:   number  (skip fills with quote value below this; default 0)
+   *   minCyclePnl?:       number  (skip cycle closes with PnL below this; default 0)
+   */
+  notificationConfig Json   @default("{}")
+
   referralCode  String? @unique
   referredById  String?
   referredBy    User?   @relation("UserReferrals", fields: [referredById], references: [id])
