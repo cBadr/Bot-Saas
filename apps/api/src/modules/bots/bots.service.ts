@@ -211,6 +211,8 @@ export class BotsService {
       avgPrice?: string;
       ordersExecuted?: number;
       cooldownUntilMs?: number;
+      cycleStartedAtMs?: number;
+      fillsThisCycle?: number;
       // ─ Common ─
       realizedPnlQuote?: string;
       cyclesCompleted?: number;
@@ -334,6 +336,103 @@ export class BotsService {
       pnlSeries.push({ ts: e.createdAt.getTime(), pnl: Number(data.realizedPnlQuote ?? 0) });
     }
 
+    // ─── Strategy-specific derived metrics ───
+    const gridLevels = num(params.gridLevels);
+    const gridSpread = num(params.gridSpread);
+    const orderSize = num(params.orderSize);
+    const takeProfit = num(params.takeProfit);
+    const priceMultMode = (params.priceMultiplierMode as string | undefined) ?? 'flat';
+    const priceMultValue = num(params.priceMultiplier) ?? 0;
+    const sizeMultMode = (params.sizeMultiplierMode as string | undefined) ?? 'flat';
+    const sizeMultValue = num(params.sizeMultiplier) ?? 0;
+
+    // Helper: compute (offset, sizeQuote) for ladder rung i (mirrors strategy._rungSpec)
+    const rungSpec = (i: number) => {
+      let offset: number;
+      if (priceMultMode === 'percent') {
+        const r = 1 + priceMultValue / 100;
+        offset = r === 1 ? gridSpread! * i
+          : gridSpread! * (Math.pow(r, i) - 1) / (r - 1);
+      } else if (priceMultMode === 'dollar') {
+        offset = i * gridSpread! + priceMultValue * i * (i - 1) / 2;
+      } else {
+        offset = gridSpread! * i;
+      }
+      let sizeQuote: number;
+      const k = i - 1;
+      if (sizeMultMode === 'percent') sizeQuote = orderSize! * Math.pow(1 + sizeMultValue / 100, k);
+      else if (sizeMultMode === 'dollar') sizeQuote = orderSize! + sizeMultValue * k;
+      else sizeQuote = orderSize!;
+      if (sizeQuote <= 0) sizeQuote = orderSize!;
+      return { offset, sizeQuote };
+    };
+
+    // Total investment (capital required for the full ladder).
+    let totalInvestment: number | null = null;
+    if (gridLevels !== null && orderSize !== null) {
+      if (sizeMultMode === 'flat' || sizeMultValue === 0) {
+        totalInvestment = gridLevels * orderSize;
+      } else {
+        let sum = 0;
+        for (let i = 1; i <= gridLevels; i++) sum += rungSpec(i).sizeQuote;
+        totalInvestment = sum;
+      }
+    }
+
+    // Bot price range (low / high boundaries of the ladder around start).
+    let priceRange: { low: number; high: number } | null = null;
+    if (startNum > 0 && gridLevels !== null && gridSpread !== null) {
+      const maxOffset = rungSpec(gridLevels).offset;
+      const direction = (params.direction as string | undefined)?.toUpperCase();
+      // Grid Simple is symmetric; DCA Simple ladder is one-sided.
+      if (isDcaSimple) {
+        if (direction === 'SELL') {
+          priceRange = { low: startNum, high: startNum + maxOffset };
+        } else {
+          priceRange = { low: Math.max(0, startNum - maxOffset), high: startNum };
+        }
+      } else {
+        // Grid Simple — symmetric
+        priceRange = {
+          low: Math.max(0, startNum - maxOffset),
+          high: startNum + maxOffset,
+        };
+      }
+    }
+
+    // Expected profit per cycle.
+    let expectedPerCycle: number | null = null;
+    if (isDcaSimple && takeProfit !== null && totalInvestment !== null && startNum > 0) {
+      // DCA Simple: TP × estimated total qty if all rungs fill at avg of expected fills.
+      // Simpler approximation matching the form's preview: takeProfit × (totalInvestment/start).
+      expectedPerCycle = takeProfit * (totalInvestment / startNum);
+    } else if (!isAnyDca && gridSpread !== null && orderSize !== null && startNum > 0) {
+      // Grid Simple: spread × (orderSize/start).
+      expectedPerCycle = gridSpread * (orderSize / startNum);
+    }
+
+    // Estimated profit if ALL rungs fill (DCA Simple — full-ladder TP scenario).
+    let estimatedProfitAllFill: number | null = null;
+    if (isDcaSimple && takeProfit !== null && gridLevels !== null && orderSize !== null && startNum > 0) {
+      let totalQty = 0;
+      for (let i = 1; i <= gridLevels; i++) {
+        const { offset, sizeQuote } = rungSpec(i);
+        const direction = (params.direction as string | undefined)?.toUpperCase();
+        const rungPrice = direction === 'SELL' ? startNum + offset : startNum - offset;
+        if (rungPrice > 0) totalQty += sizeQuote / rungPrice;
+      }
+      estimatedProfitAllFill = takeProfit * totalQty;
+    }
+
+    // Break-even (DCA-BUY) = avgPrice (current weighted-avg cost).
+    // For DCA-SELL: avgPrice = avg sell proceeds; market ≤ avgPrice means profit.
+    const avgPrice = isAnyDca && state.avgPrice && Number(state.avgPrice) > 0
+      ? Number(state.avgPrice) : null;
+
+    // Open BUY / SELL counts (current open orders only).
+    const openBuyCount = orders.filter((o) => o.side === 'BUY' && o.status === 'open').length;
+    const openSellCount = orders.filter((o) => o.side === 'SELL' && o.status === 'open').length;
+
     return {
       botId: bot.id,
       symbol: bot.symbol,
@@ -377,10 +476,36 @@ export class BotsService {
         heldQty,
         soldQty,
         signedHeld,
+        // DCA-only break-even (= weighted avg cost). Null for Grid / no position.
+        breakEvenPrice: avgPrice,
       },
       volume: {
         totalQuote: totalVolume,
         tradeCount: volumeAgg._count,
+      },
+      // ─── New: detailed config + derived metrics for the UI cards ───
+      config: {
+        direction: (params.direction as string | undefined) ?? null,
+        gridLevels,
+        gridSpread,
+        orderSize,
+        takeProfit,
+        priceMultiplierMode: priceMultMode,
+        priceMultiplier: priceMultValue,
+        sizeMultiplierMode: sizeMultMode,
+        sizeMultiplier: sizeMultValue,
+        cooldownMinutes: num(params.cooldownMinutes),
+        recenterAfterMinutes: num(params.recenterAfterMinutes),
+        durationMinutes: num(params.durationMinutes),
+        customStartPrice: num(params.customStartPrice),
+      },
+      derived: {
+        priceRange,
+        totalInvestment,
+        expectedPerCycle,
+        estimatedProfitAllFill,
+        openBuyCount,
+        openSellCount,
       },
       // Cooldown status (DCA Simple only — null for other strategies).
       cooldown: state.cooldownUntilMs && state.cooldownUntilMs > Date.now()

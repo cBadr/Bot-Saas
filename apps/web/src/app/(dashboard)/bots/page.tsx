@@ -104,8 +104,25 @@ function BotRow({
             <div className="flex items-center gap-3 flex-wrap min-w-0">
               <h3 className="font-semibold truncate">{b.name}</h3>
               <StatusBadge status={b.status} />
+              {b.paperTrading && (
+                <Badge variant="outline" className="text-[10px] border-yellow-500/50 text-yellow-700 dark:text-yellow-400">
+                  paper
+                </Badge>
+              )}
               <Badge variant="outline" className="font-mono text-[10px]">{b.symbol}</Badge>
               <Badge variant="secondary" className="text-[10px]">{b.strategy?.name ?? '—'}</Badge>
+              {(() => {
+                const dir = (b.params?.direction as string | undefined)?.toUpperCase();
+                if (!dir || (dir !== 'BUY' && dir !== 'SELL')) return null;
+                return (
+                  <Badge
+                    variant={dir === 'BUY' ? 'success' : 'destructive'}
+                    className="text-[10px] font-mono"
+                  >
+                    {dir}
+                  </Badge>
+                );
+              })()}
               {b.startedAt && isRunning && (
                 <span className="text-xs text-muted-foreground">running {formatDuration(b.startedAt)}</span>
               )}

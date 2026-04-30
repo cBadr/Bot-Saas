@@ -199,6 +199,8 @@ export interface BotLive {
     soldQty: number;
     /** Net signed exposure used for unrealized math (+held −sold). */
     signedHeld: number;
+    /** DCA-only break-even price (= weighted avg cost). null if no position / Grid. */
+    breakEvenPrice: number | null;
   };
   volume: {
     /** Total notional traded in quote (FDUSD). Σ trade.quoteQuantity. */
@@ -207,6 +209,31 @@ export interface BotLive {
   };
   /** Active cooldown info (DCA Simple only — null otherwise). */
   cooldown: { untilMs: number; secondsRemaining: number } | null;
+  /** Bot configuration as parsed from the params (mirrored for convenience). */
+  config: {
+    direction: string | null;
+    gridLevels: number | null;
+    gridSpread: number | null;
+    orderSize: number | null;
+    takeProfit: number | null;
+    priceMultiplierMode: string;
+    priceMultiplier: number;
+    sizeMultiplierMode: string;
+    sizeMultiplier: number;
+    cooldownMinutes: number | null;
+    recenterAfterMinutes: number | null;
+    durationMinutes: number | null;
+    customStartPrice: number | null;
+  };
+  /** Server-computed derivatives so the UI doesn't have to re-implement formulas. */
+  derived: {
+    priceRange: { low: number; high: number } | null;
+    totalInvestment: number | null;
+    expectedPerCycle: number | null;
+    estimatedProfitAllFill: number | null;
+    openBuyCount: number;
+    openSellCount: number;
+  };
 }
 
 export const useBotLive = (id: string) =>
