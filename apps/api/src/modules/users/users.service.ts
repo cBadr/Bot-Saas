@@ -64,6 +64,7 @@ export class UsersService {
         telegramChatId: true, telegramUsername: true,
         discordWebhookUrl: true, pushSubscriptions: true,
         fillFrequency: true, notificationConfig: true, lastStatusReportAt: true,
+        trialEndsAt: true,
         referralCode: true, createdAt: true, lastLoginAt: true,
       },
     });

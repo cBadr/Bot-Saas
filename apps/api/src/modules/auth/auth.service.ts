@@ -104,6 +104,7 @@ export class AuthService {
     }
 
     const passwordHash = await argon2.hash(dto.password);
+    const trialEndsAt = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000);
     const user = await this.prisma.user.create({
       data: {
         email: dto.email,
@@ -111,6 +112,7 @@ export class AuthService {
         fullName: dto.fullName,
         referralCode: nanoid(10),
         referredById,
+        trialEndsAt,
       },
       select: { id: true, email: true, role: true, fullName: true, referralCode: true },
     });

@@ -24,6 +24,7 @@ export interface User {
   fillFrequency?: FillFrequency;
   notificationConfig?: NotificationConfig | null;
   lastStatusReportAt?: string | null;
+  trialEndsAt?: string | null;
   referralCode?: string | null; createdAt: string; lastLoginAt?: string | null;
 }
 

@@ -185,6 +185,9 @@ model User {
   referredBy    User?   @relation("UserReferrals", fields: [referredById], references: [id])
   referrals     User[]  @relation("UserReferrals")
 
+  /** When the user's 14-day free trial ends. Set at signup. Null = trial converted/skipped. */
+  trialEndsAt DateTime?
+
   lastLoginAt DateTime?
   lastLoginIp String?
 

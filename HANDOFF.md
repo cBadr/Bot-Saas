@@ -1,6 +1,6 @@
 # 🐋 Orca — Project Handoff & Reference
 
-**Last updated:** 2026-05-02 (post-Sprint 2: Email + Discord + Push)
+**Last updated:** 2026-05-02 (post-Sprint 3: Commercial Foundation)
 **Owner:** Badr
 **Path:** `c:\Users\Badr\OneDrive\Desktop\Trading\`
 **Repo:** local only, branch `master`
@@ -9,7 +9,8 @@
 > Read this file first when resuming work. It captures architecture, conventions,
 > hard-won gotchas, and the full implementation history of the trading-engine
 > rewrite (Apr 27–30, 2026), the Safety Net (tests + Sentry + CI + backups + runbook),
-> and Sprint 2 channel expansion (Email via Resend, Discord webhooks, Web Push / PWA).
+> and Sprints 2–3: channel expansion (Email/Discord/Push) and commercial foundation
+> (rewritten landing, EN/AR i18n, legal pages, 14-day free trial).
 
 ---
 
@@ -36,6 +37,9 @@ A **professional crypto trading SaaS** built on Binance Spot, with:
 - **Cycle-based P&L** — authoritative per-cycle accounting (NOT weighted-avg cost basis)
 - **Paper trading** + Backtesting against real historical data
 - **Multi-channel notifications:** in-app inbox + Telegram + Email (Resend) + Discord webhooks + Web Push (PWA) — with custom rules, fill-frequency modes, and periodic status digests
+- **Bilingual UI** — English + Arabic with RTL support; locale toggle in nav, persisted to localStorage + cookie
+- **14-day free trial** — automatic on signup, banner across dashboard linking to upgrade, no credit card required
+- **Legal pages** — Privacy Policy, Terms of Service, GDPR rights (with right-to-erasure and data export described)
 - **Risk management:** daily loss limit, max drawdown auto-stop, kill switch
 - **Multi-tenant:** users, API keys, subscriptions
 - **CoinPayments crypto subscriptions**
@@ -762,6 +766,11 @@ API client (`lib/api.ts`):
 | **Web Push (VAPID) service** | `apps/api/src/modules/notifications/web-push.service.ts` |
 | **Push browser helper** | `apps/web/src/lib/push.ts` |
 | **Push service worker** | `apps/web/public/sw.js` |
+| **i18n provider + dictionaries** | `apps/web/src/lib/i18n.tsx` (EN + AR, RTL, LocaleToggle) |
+| **Legal pages** | `apps/web/src/app/{privacy,terms,gdpr}/page.tsx` + `components/legal-layout.tsx` |
+| **Trial banner** | `apps/web/src/components/trial-banner.tsx` (in dashboard layout) |
+| **Trial signup hook** | `apps/api/src/modules/auth/auth.service.ts` (sets `trialEndsAt = now + 14d`) |
+| **Landing page** | `apps/web/src/app/page.tsx` |
 | **Periodic status reports** | `apps/api/src/modules/status-report/status-report.service.ts` |
 | **Wallet (manual trading)** | `apps/api/src/modules/wallet/`, `apps/web/src/app/(dashboard)/wallet/page.tsx` |
 | **CoinPayments client** | `apps/api/src/modules/payments/coinpayments.client.ts` |
@@ -807,6 +816,7 @@ API client (`lib/api.ts`):
 - ✅ **DEPLOYMENT.md** — Windows Server production deploy guide (Nginx + win-acme + NSSM)
 - ✅ **Sprint 1 — Safety Net** (2026-04-30) — Vitest 4.1.5 workspace + 39 tests across `grid_simple`/`dca_simple`/`event-types`, Sentry on API/Engine/Web (5 config files), GitHub Actions CI with Postgres 17 service container, `scripts/backup-db.ps1` (pg_dump + auto-prune 14d), `RUNBOOK.md` with 11 operational scenarios
 - ✅ **Sprint 2 — Channel expansion** (2026-05-02) — Email via Resend (`email.service.ts`), Discord webhooks per-user (`discord.service.ts`), Web Push / PWA via `web-push` + VAPID + service worker `public/sw.js` + `lib/push.ts`. Added `User.discordWebhookUrl` + `User.pushSubscriptions` (Json), `NotificationChannel.PUSH` enum value, 6 new endpoints (`/users/me/{email,discord,push}/test`, `/users/me/push/{subscribe,unsubscribe}`), 3 new settings cards in `/settings/notifications`
+- ✅ **Sprint 3 — Commercial Foundation** (2026-05-02) — Rewritten landing (hero / 6-feature grid / trust strip / 3-tier pricing teaser / footer), lightweight EN↔AR i18n (`lib/i18n.tsx` provider + `LocaleToggle`, RTL via `dir`, localStorage + cookie), 3 legal pages (`/privacy`, `/terms`, `/gdpr`) sharing `LegalLayout`, 14-day free trial (`User.trialEndsAt` set on register, `TrialBanner` component in dashboard layout — active / ending-soon / expired states linking to `/billing`)
 
 ## 📋 Phases Remaining
 
@@ -815,6 +825,13 @@ API client (`lib/api.ts`):
 - ~~Discord webhooks~~ ✅
 - ~~Push notifications (PWA service worker)~~ ✅
 - (Optional polish: HTML templates per event type, daily P&L summary email, SMTP fallback)
+
+### Phase 10.5 — Commercial Foundation polish (deferred from Sprint 3)
+- Translate dashboard interior + settings + bot forms to AR (Sprint 3 covered landing + nav + trial banner only)
+- Implement actual GDPR export + delete endpoints (`POST /users/me/export`, `DELETE /users/me`) — pages reference them but backend wiring is pending
+- `/billing` page: surface trial countdown + upgrade flow + plan picker (currently `TrialBanner` links there but page wiring is pre-existing)
+- Add testimonials / social proof section to landing once we have real users
+- Add `noindex` meta to `/login` `/register` `/dashboard/*`; add sitemap.xml + robots.txt for marketing pages
 
 ### Phase 11 — Multi-Exchange (~5-8 days)
 - Bybit, OKX, KuCoin connectors
