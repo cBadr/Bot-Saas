@@ -25,6 +25,7 @@ import { ReportsModule } from './modules/reports/reports.module';
 import { BacktestModule } from './modules/backtest/backtest.module';
 import { RealtimeModule } from './modules/realtime/realtime.module';
 import { WalletModule } from './modules/wallet/wallet.module';
+import { StatusReportModule } from './modules/status-report/status-report.module';
 
 @Module({
   imports: [
@@ -47,6 +48,7 @@ import { WalletModule } from './modules/wallet/wallet.module';
     BacktestModule,
     RealtimeModule,
     WalletModule,
+    StatusReportModule,
     AdminModule,
   ],
   providers: [

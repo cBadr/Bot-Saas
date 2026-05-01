@@ -2,13 +2,17 @@
 import { useEffect, useState } from 'react';
 import { toast } from 'sonner';
 import { useNotificationPreferences, useSetNotificationPreference } from '@/lib/queries-v3';
-import { useMe, useUpdateProfile, useTestTelegram, type FillFrequency, type NotificationConfig } from '@/lib/queries';
+import {
+  useMe, useUpdateProfile, useTestTelegram, useSendStatusReportNow, useBots,
+  type FillFrequency, type NotificationConfig,
+} from '@/lib/queries';
+import { formatDuration } from '@/lib/utils';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { ArrowLeft, Send, MessageCircle, Bell } from 'lucide-react';
+import { ArrowLeft, Send, MessageCircle, Bell, FileText, Clock } from 'lucide-react';
 import Link from 'next/link';
 
 const EVENTS: { key: string; label: string; desc: string }[] = [
@@ -21,6 +25,7 @@ const EVENTS: { key: string; label: string; desc: string }[] = [
   { key: 'STOP_LOSS_HIT', label: 'Stop-loss hit', desc: 'When an SL or daily-loss limit triggers.' },
   { key: 'PAYMENT_RECEIVED', label: 'Payment received', desc: 'When CoinPayments confirms a payment.' },
   { key: 'SUBSCRIPTION_EXPIRING', label: 'Subscription expiring', desc: 'A few days before expiry.' },
+  { key: 'STATUS_REPORT', label: 'Periodic status report', desc: 'Scheduled comprehensive report (configured above).' },
 ];
 
 const CHANNELS: { key: 'IN_APP' | 'TELEGRAM' | 'EMAIL' | 'DISCORD'; label: string }[] = [
@@ -116,6 +121,75 @@ export default function NotificationPreferencesPage() {
   };
   const updateDraft = (patch: Partial<NotificationConfig>) =>
     setDraftCfg((prev) => ({ ...prev, ...patch }));
+
+  // ─── Periodic status report state ───
+  const { data: bots } = useBots();
+  const sendNow = useSendStatusReportNow();
+  const intervalCurrent = cfg.statusReportIntervalMinutes ?? 0;
+  const reportBotsCurrent = cfg.statusReportBots ?? 'ALL';
+  const isAllBots = reportBotsCurrent === 'ALL';
+  const selectedBotIds: string[] = isAllBots ? [] : (reportBotsCurrent as string[]);
+
+  const setReportInterval = (minutes: number) => {
+    updateProfile.mutate(
+      {
+        notificationConfig: {
+          ...cfg,
+          statusReportIntervalMinutes: minutes,
+          // Keep existing bot selection.
+          statusReportBots: cfg.statusReportBots ?? 'ALL',
+        },
+      },
+      {
+        onSuccess: () => toast.success(
+          minutes === 0 ? 'Periodic reports disabled' : `Reports every ${minutes}m`,
+        ),
+        onError: (e) => toast.error(e.message),
+      },
+    );
+  };
+
+  const setReportBots = (next: 'ALL' | string[]) => {
+    updateProfile.mutate(
+      {
+        notificationConfig: {
+          ...cfg,
+          statusReportBots: next,
+        },
+      },
+      {
+        onSuccess: () => toast.success('Bot selection updated'),
+        onError: (e) => toast.error(e.message),
+      },
+    );
+  };
+
+  const toggleBotInReport = (botId: string) => {
+    const current = isAllBots
+      ? (bots ?? []).map((b) => b.id) // expand 'ALL' to explicit list before toggling
+      : selectedBotIds;
+    const next = current.includes(botId)
+      ? current.filter((id) => id !== botId)
+      : [...current, botId];
+    setReportBots(next);
+  };
+
+  const handleSendNow = () => {
+    sendNow.mutate(undefined, {
+      onSuccess: (r) => {
+        if (r.ok) {
+          toast.success(`Status report sent (${r.botsIncluded} bot${r.botsIncluded === 1 ? '' : 's'})`);
+        } else {
+          toast.error(r.reason ?? 'Could not send report');
+        }
+      },
+      onError: (e) => toast.error(e.message),
+    });
+  };
+
+  const lastSentLabel = me?.lastStatusReportAt
+    ? formatDuration(me.lastStatusReportAt) + ' ago'
+    : 'never';
 
   return (
     <div className="space-y-6 max-w-5xl">
@@ -315,6 +389,157 @@ export default function NotificationPreferencesPage() {
               </div>
             </div>
           )}
+        </CardContent>
+      </Card>
+
+      {/* ─── Periodic status reports ─── */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base flex items-center gap-2">
+            <FileText className="h-4 w-4 text-primary" />
+            Periodic status reports
+          </CardTitle>
+          <CardDescription>
+            Receive a comprehensive Telegram digest of your bots&apos; status on a schedule.
+            Includes profits, cycle counts, and ladder shape for each selected bot.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {/* Interval picker */}
+          <div className="space-y-2">
+            <Label className="text-xs uppercase tracking-wide text-muted-foreground">Send every</Label>
+            <div className="flex flex-wrap gap-2">
+              {[
+                { v: 0, label: 'Off' },
+                { v: 15, label: '15m' },
+                { v: 30, label: '30m' },
+                { v: 60, label: '1h' },
+                { v: 240, label: '4h' },
+                { v: 1440, label: '24h' },
+              ].map(({ v, label }) => {
+                const active = intervalCurrent === v;
+                return (
+                  <button
+                    key={v}
+                    type="button"
+                    onClick={() => setReportInterval(v)}
+                    disabled={updateProfile.isPending}
+                    className={`px-3 py-1.5 rounded-md border text-xs font-mono transition-colors ${
+                      active
+                        ? 'border-primary bg-primary text-primary-foreground'
+                        : 'border-border hover:border-primary/40 hover:bg-accent/40'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+            {intervalCurrent > 0 && (
+              <p className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                <Clock className="h-3 w-3" />
+                Last sent: <span className="font-mono">{lastSentLabel}</span>
+              </p>
+            )}
+          </div>
+
+          {/* Bot selector */}
+          {intervalCurrent > 0 && (
+            <div className="space-y-2 pt-2 border-t">
+              <Label className="text-xs uppercase tracking-wide text-muted-foreground">
+                Bots to include
+              </Label>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => setReportBots('ALL')}
+                  className={`text-left rounded-md border p-3 transition-colors ${
+                    isAllBots
+                      ? 'border-primary bg-primary/5 ring-1 ring-primary/40'
+                      : 'border-border hover:border-primary/40 hover:bg-accent/40'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="font-semibold text-sm">All my bots</span>
+                    {isAllBots && <Badge variant="default" className="text-[9px]">Active</Badge>}
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    Auto-includes any bot you create later. {(bots?.length ?? 0)} bot{(bots?.length ?? 0) === 1 ? '' : 's'} currently.
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setReportBots(selectedBotIds.length ? selectedBotIds : (bots ?? []).map((b) => b.id))}
+                  className={`text-left rounded-md border p-3 transition-colors ${
+                    !isAllBots
+                      ? 'border-primary bg-primary/5 ring-1 ring-primary/40'
+                      : 'border-border hover:border-primary/40 hover:bg-accent/40'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="font-semibold text-sm">Custom selection</span>
+                    {!isAllBots && (
+                      <Badge variant="default" className="text-[9px]">
+                        {selectedBotIds.length} selected
+                      </Badge>
+                    )}
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    Pick which bots appear in the report.
+                  </div>
+                </button>
+              </div>
+
+              {/* Per-bot toggles when in Custom mode */}
+              {!isAllBots && (
+                <div className="rounded-md border bg-muted/20 p-2 max-h-64 overflow-y-auto space-y-1">
+                  {(bots ?? []).length === 0 ? (
+                    <div className="text-xs text-muted-foreground italic px-2 py-3 text-center">
+                      You don&apos;t have any bots yet.
+                    </div>
+                  ) : (
+                    (bots ?? []).map((b) => {
+                      const checked = selectedBotIds.includes(b.id);
+                      return (
+                        <label
+                          key={b.id}
+                          className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-accent/40 cursor-pointer"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => toggleBotInReport(b.id)}
+                            className="rounded border-input"
+                          />
+                          <div className="flex-1 min-w-0 flex items-center gap-2">
+                            <span className="text-sm font-medium truncate">{b.name}</span>
+                            <Badge variant="outline" className="font-mono text-[9px]">{b.symbol}</Badge>
+                            <Badge variant="secondary" className="text-[9px]">{b.status}</Badge>
+                          </div>
+                        </label>
+                      );
+                    })
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Send-now preview button */}
+          <div className="flex items-center gap-2 pt-2 border-t">
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleSendNow}
+              disabled={sendNow.isPending || (bots?.length ?? 0) === 0}
+            >
+              <Send className="h-3.5 w-3.5" />
+              {sendNow.isPending ? 'Sending…' : 'Send report now'}
+            </Button>
+            <span className="text-[11px] text-muted-foreground">
+              Preview the report with your current selection.
+            </span>
+          </div>
         </CardContent>
       </Card>
 

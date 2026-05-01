@@ -49,6 +49,21 @@ export class BotsService {
     const symbols = [...new Set(bots.map((b) => b.symbol))];
     const priceMap = await this.bulkTickerPrices(symbols);
 
+    // Bulk-aggregate volume per bot in a single query (groupBy).
+    const volumeAgg = await this.prisma.trade.groupBy({
+      by: ['botId'],
+      where: { botId: { in: bots.map((b) => b.id) } },
+      _sum: { quoteQuantity: true },
+      _count: true,
+    });
+    const volumeByBot = new Map<string, { totalQuote: number; tradeCount: number }>();
+    for (const v of volumeAgg) {
+      volumeByBot.set(v.botId, {
+        totalQuote: Number(v._sum.quoteQuantity ?? 0),
+        tradeCount: v._count,
+      });
+    }
+
     return bots.map((b) => {
       const state = (b.state ?? {}) as {
         initialStartPrice?: string;
@@ -105,6 +120,8 @@ export class BotsService {
         ? gridSpread * (orderSize / startNum)
         : null;
 
+      const vol = volumeByBot.get(b.id) ?? { totalQuote: 0, tradeCount: 0 };
+
       return {
         ...b,
         marketPrice: marketNum > 0 ? marketNum.toString() : null,
@@ -116,6 +133,8 @@ export class BotsService {
           total,
           heldQty,
           startPrice: startNum > 0 ? startNum : null,
+          totalVolumeQuote: vol.totalQuote,
+          tradeCount: vol.tradeCount,
         },
       };
     });

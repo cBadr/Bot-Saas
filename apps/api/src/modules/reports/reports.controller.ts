@@ -18,6 +18,21 @@ export class ReportsController {
     return this.svc.pnlSeries(u.sub, days ? Number(days) : 30);
   }
 
+  @Get('per-bot')
+  perBot(@CurrentUser() u: CurrentUserPayload) {
+    return this.svc.perBotBreakdown(u.sub);
+  }
+
+  @Get('per-symbol')
+  perSymbol(@CurrentUser() u: CurrentUserPayload) {
+    return this.svc.symbolBreakdown(u.sub);
+  }
+
+  @Get('best-worst-day')
+  bestWorst(@CurrentUser() u: CurrentUserPayload, @Query('days') days?: string) {
+    return this.svc.bestWorstDay(u.sub, days ? Number(days) : 30);
+  }
+
   @Get('bots/:id')
   perf(@CurrentUser() u: CurrentUserPayload, @Param('id') id: string) {
     return this.svc.botPerformance(u.sub, id);

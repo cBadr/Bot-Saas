@@ -5,10 +5,14 @@ import { api, apiCall, tokenStore } from './api';
 export type FillFrequency = 'OFF' | 'PER_CYCLE' | 'PER_FILL' | 'CUSTOM';
 
 export interface NotificationConfig {
+  // Fill filters (when fillFrequency = 'CUSTOM')
   notifyOnBuyFills?: boolean;
   notifyOnSellFills?: boolean;
   minFillNotional?: number;
   minCyclePnl?: number;
+  // Periodic status reports
+  statusReportIntervalMinutes?: number;
+  statusReportBots?: 'ALL' | string[];
 }
 
 export interface User {
@@ -17,6 +21,7 @@ export interface User {
   telegramChatId?: string | null; telegramUsername?: string | null;
   fillFrequency?: FillFrequency;
   notificationConfig?: NotificationConfig | null;
+  lastStatusReportAt?: string | null;
   referralCode?: string | null; createdAt: string; lastLoginAt?: string | null;
 }
 
@@ -48,6 +53,20 @@ export const useTestTelegram = () =>
   useMutation({
     mutationFn: () => apiCall<{ ok: true }>(() => api.post('/users/me/telegram/test', {})),
   });
+
+/**
+ * Manually fire a status report immediately (preview the periodic report).
+ * Updates `lastStatusReportAt` on success which delays the next scheduled send.
+ */
+export const useSendStatusReportNow = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => apiCall<{ ok: boolean; reason?: string; botsIncluded?: number }>(
+      () => api.post('/status-report/send-now', {}),
+    ),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['me'] }),
+  });
+};
 
 export const useLogin = () =>
   useMutation({
@@ -145,6 +164,8 @@ export interface BotLiveStats {
   total: number;
   heldQty: number;
   startPrice: number | null;
+  totalVolumeQuote: number;
+  tradeCount: number;
 }
 
 export interface Bot {

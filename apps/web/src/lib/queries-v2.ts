@@ -49,23 +49,106 @@ export const useCheckout = () =>
   });
 
 // ─── Reports ───
+export interface ReportsOverview {
+  totals: {
+    realized: number;
+    unrealized: number;
+    total: number;
+    volume: number;
+    trades: number;
+    cycles: number;
+    investment: number;
+    heldQty: number;
+    wins: number;
+    losses: number;
+    winRate: number | null;
+    roiPct: number | null;
+    avgPerCycle: number | null;
+  };
+  bots: { total: number; running: number; stopped: number; errored: number };
+}
+
 export const useReportsOverview = () =>
   useQuery({
     queryKey: ['reports', 'overview'],
-    queryFn: () => apiCall<{
-      totals: { realizedPnl: number; unrealizedPnl: number; volume: number; trades: number };
-      bots: { total: number; running: number };
-    }>(() => api.get('/reports/overview')),
+    queryFn: () => apiCall<ReportsOverview>(() => api.get('/reports/overview')),
     enabled: !!tokenStore.access,
+    refetchInterval: 30_000,
   });
+
+export interface PnlSeriesPoint {
+  date: string;
+  pnl: number;
+  cycles: number;
+  volume: number;
+  trades: number;
+  cumulative: number;
+}
 
 export const usePnlSeries = (days = 30) =>
   useQuery({
     queryKey: ['reports', 'pnl', days],
-    queryFn: () => apiCall<Array<{ date: string; pnl: number; volume: number; count: number }>>(
+    queryFn: () => apiCall<PnlSeriesPoint[]>(
       () => api.get(`/reports/pnl-series?days=${days}`),
     ),
     enabled: !!tokenStore.access,
+    refetchInterval: 30_000,
+  });
+
+export interface PerBotRow {
+  id: string;
+  name: string;
+  symbol: string;
+  status: string;
+  strategy: string | null;
+  direction: string | null;
+  paperTrading: boolean;
+  cycles: number;
+  realized: number;
+  unrealized: number;
+  total: number;
+  volume: number;
+  trades: number;
+  investment: number;
+  roi: number | null;
+  startedAt: string | null;
+  createdAt: string;
+}
+
+export const usePerBotBreakdown = () =>
+  useQuery({
+    queryKey: ['reports', 'per-bot'],
+    queryFn: () => apiCall<PerBotRow[]>(() => api.get('/reports/per-bot')),
+    enabled: !!tokenStore.access,
+    refetchInterval: 30_000,
+  });
+
+export interface PerSymbolRow {
+  symbol: string;
+  bots: number;
+  realized: number;
+  total: number;
+  volume: number;
+  cycles: number;
+}
+
+export const usePerSymbolBreakdown = () =>
+  useQuery({
+    queryKey: ['reports', 'per-symbol'],
+    queryFn: () => apiCall<PerSymbolRow[]>(() => api.get('/reports/per-symbol')),
+    enabled: !!tokenStore.access,
+    refetchInterval: 30_000,
+  });
+
+export const useBestWorstDay = (days = 30) =>
+  useQuery({
+    queryKey: ['reports', 'best-worst-day', days],
+    queryFn: () => apiCall<{
+      best: PnlSeriesPoint | null;
+      worst: PnlSeriesPoint | null;
+    }>(() => api.get(`/reports/best-worst-day?days=${days}`)),
+    enabled: !!tokenStore.access,
+    refetchInterval: 30_000,
   });
 
 // ─── Backtest ───

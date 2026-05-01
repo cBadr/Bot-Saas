@@ -56,7 +56,7 @@ export class UsersService {
         id: true, email: true, fullName: true, avatarUrl: true,
         role: true, status: true, twoFactorEnabled: true,
         telegramChatId: true, telegramUsername: true,
-        fillFrequency: true, notificationConfig: true,
+        fillFrequency: true, notificationConfig: true, lastStatusReportAt: true,
         referralCode: true, createdAt: true, lastLoginAt: true,
       },
     });

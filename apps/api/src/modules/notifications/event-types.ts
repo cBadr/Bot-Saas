@@ -23,6 +23,7 @@ export type FillFrequency = 'OFF' | 'PER_CYCLE' | 'PER_FILL' | 'CUSTOM';
  * be added without a schema migration.
  */
 export interface NotificationConfig {
+  // ─── Fill filters (when fillFrequency = 'CUSTOM') ───
   /** Notify on opening BUY-side fills (ladder accumulation in BUY-mode). Default true. */
   notifyOnBuyFills?: boolean;
   /** Notify on opening SELL-side fills (ladder distribution in SELL-mode). Default true. */
@@ -31,6 +32,12 @@ export interface NotificationConfig {
   minFillNotional?: number;
   /** Suppress cycle closes whose PnL is below this threshold (absolute value). Default 0 = no filter. */
   minCyclePnl?: number;
+
+  // ─── Periodic status reports ───
+  /** How often to send a comprehensive status report. 0 / undefined = disabled. */
+  statusReportIntervalMinutes?: number;
+  /** Bots to include in the report. 'ALL' = every owned bot, or an explicit list of bot ids. Default 'ALL'. */
+  statusReportBots?: 'ALL' | string[];
 }
 
 export interface BotEventCtx {

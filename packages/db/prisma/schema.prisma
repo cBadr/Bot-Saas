@@ -154,14 +154,21 @@ model User {
   //   CUSTOM     — apply user-defined rules in `notificationConfig`
   fillFrequency   String  @default("PER_CYCLE")
   /**
-   * Free-form JSON for advanced notification rules. Applied only when
-   * `fillFrequency = 'CUSTOM'`. Recognized keys:
-   *   notifyOnBuyFills?:  boolean (default true)
-   *   notifyOnSellFills?: boolean (default true)
-   *   minFillNotional?:   number  (skip fills with quote value below this; default 0)
-   *   minCyclePnl?:       number  (skip cycle closes with PnL below this; default 0)
+   * Free-form JSON for advanced notification rules. Recognized keys:
+   *
+   *   FILL FILTERS (active only when fillFrequency = 'CUSTOM'):
+   *     notifyOnBuyFills?:  boolean (default true)
+   *     notifyOnSellFills?: boolean (default true)
+   *     minFillNotional?:   number  (skip fills with quote value below this; default 0)
+   *     minCyclePnl?:       number  (skip cycle closes with PnL below this; default 0)
+   *
+   *   PERIODIC STATUS REPORTS:
+   *     statusReportIntervalMinutes?: number  (0 / undefined = disabled)
+   *     statusReportBots?:            'ALL' | string[]  (default 'ALL')
    */
   notificationConfig Json   @default("{}")
+  /** When the last periodic status report was sent. Used by StatusReportService to gate the next send. */
+  lastStatusReportAt DateTime?
 
   referralCode  String? @unique
   referredById  String?
