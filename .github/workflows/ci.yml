@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+# Cancel in-flight runs on the same branch when a newer commit arrives.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Empty placeholders so packages/config doesn't fail Zod validation in CI.
+  DATABASE_URL: postgresql://postgres:postgres@localhost:5432/orca_test?schema=public
+  REDIS_URL: redis://127.0.0.1:6379
+  AUTH_SECRET: ci-secret-must-be-at-least-sixteen-chars-long-padding
+  ENCRYPTION_SECRET: ci-encryption-secret-must-be-at-least-32-chars-padding
+  NODE_ENV: test
+
+jobs:
+  lint-test-build:
+    name: Lint · Test · Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: orca_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.6.2
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Prisma client
+        run: pnpm --filter @orca/db prisma generate
+
+      - name: Type-check (all packages)
+        run: pnpm type-check
+
+      - name: Build (all packages)
+        run: pnpm build
+
+      - name: Run tests
+        run: pnpm test
+
+  # Separate job that doesn't need the full pipeline — fast-fail on broken
+  # imports / syntax errors before the heavier build runs.
+  syntax-check:
+    name: Syntax sanity check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.6.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @orca/strategies test

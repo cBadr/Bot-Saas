@@ -1,4 +1,5 @@
 import 'reflect-metadata';
+import './sentry'; // ← MUST be before NestFactory; no-op when SENTRY_DSN_API unset
 import { NestFactory } from '@nestjs/core';
 import { Logger } from '@nestjs/common';
 import type { NestExpressApplication } from '@nestjs/platform-express';

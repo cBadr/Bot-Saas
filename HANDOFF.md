@@ -1,6 +1,6 @@
 # 🐋 Orca — Project Handoff & Reference
 
-**Last updated:** 2026-04-30
+**Last updated:** 2026-04-30 (post-Sprint 1: Safety Net)
 **Owner:** Badr
 **Path:** `c:\Users\Badr\OneDrive\Desktop\Trading\`
 **Repo:** local only, branch `master`
@@ -8,7 +8,7 @@
 
 > Read this file first when resuming work. It captures architecture, conventions,
 > hard-won gotchas, and the full implementation history of the trading-engine
-> rewrite (Apr 27–30, 2026).
+> rewrite (Apr 27–30, 2026) plus the Safety Net (tests + Sentry + CI + backups + runbook).
 
 ---
 
@@ -61,10 +61,12 @@ Trading/
 │   ├── db/            # @orca/db — Prisma 6
 │   ├── exchange/      # @orca/exchange — Binance connector
 │   └── strategies/    # @orca/strategies — Grid/DCA/MA/Graph + Simple variants
-├── scripts/           # PowerShell helpers (start-all, stop-all, fresh-build)
+├── scripts/           # PowerShell helpers (start-all, stop-all, fresh-build, backup-db)
+├── .github/workflows/ # CI (ci.yml — Postgres service container, lint+test+build)
 ├── .env               # all secrets here
 ├── RUNNING.md         # user-facing run guide
-├── DEPLOYMENT.md      # Windows Server production deploy guide (NEW)
+├── DEPLOYMENT.md      # Windows Server production deploy guide
+├── RUNBOOK.md         # 11 operational scenarios (NEW — Sprint 1)
 └── HANDOFF.md         # this file
 ```
 
@@ -391,6 +393,73 @@ Most events emit from strategies via `ctx.emit()`. **Risk events (`RISK_DAILY_LO
 
 ---
 
+## 🧪 Testing, CI & Observability (Sprint 1 — Safety Net)
+
+Added 2026-04-30. Foundational reliability layer before commercial features.
+
+### Vitest setup
+
+- **Vitest 4.1.5** workspace at root: `vitest.workspace.ts`
+- Per-package configs: `packages/strategies/vitest.config.ts`, `apps/api/vitest.config.ts`
+- Run all: `pnpm test` (or `pnpm --filter <pkg> test`)
+- Test files excluded from `tsc` builds via `tsconfig.json` `exclude: ["src/**/*.test.ts", "src/__test__/**"]`
+
+### Current coverage (39 tests passing)
+
+| Suite | File | Tests |
+|-------|------|-------|
+| Grid Simple | `packages/strategies/src/grid_simple/strategy.test.ts` | 10 (placement, cycle matching, processedFills FIFO, idempotency, state migration) |
+| DCA Simple | `packages/strategies/src/dca_simple/strategy.test.ts` | 12 (ladder direction, multipliers flat/percent/dollar, counter placement, cooldown gating, recenter inactivity guard) |
+| Event mapping | `apps/api/src/modules/notifications/event-types.test.ts` | 17 (cycle close, opening leg gating, CUSTOM rules, side filters, minFillNotional, RISK_*, unknown events) |
+
+### Mock utilities
+
+- `packages/strategies/src/__test__/test-utils.ts` — `createMockCtx()` factory:
+  - In-memory state (`saveState`/`loadState`)
+  - Mock Binance client recording `placeOrder`/`cancelOrder` calls
+  - Helpers: `setTickerPrice`, `setOpenOrders`, `setNextPlaceError`, `lastEmit`, `countEmits`
+
+### Sentry integration
+
+5 config files, all gated on env DSN being set (no-ops otherwise):
+
+- `apps/api/src/sentry.ts` — `@sentry/nestjs`
+- `apps/engine/src/sentry.ts` — `@sentry/node`
+- `apps/web/sentry.client.config.ts`, `sentry.server.config.ts`, `sentry.edge.config.ts` — `@sentry/nextjs`
+
+API and Engine import `./sentry` as the FIRST import in `main.ts` (before NestFactory) so instrumentation is hooked early.
+
+Env vars (all optional):
+- `SENTRY_DSN_API`, `SENTRY_DSN_ENGINE`, `SENTRY_DSN_WEB`
+- `SENTRY_TRACES_SAMPLE_RATE` (default 0)
+- `SENTRY_ENVIRONMENT` (default `development`)
+
+### GitHub Actions CI
+
+`.github/workflows/ci.yml` — two jobs:
+1. **`lint-test-build`** — Postgres 17 service container, runs `pnpm install`, type-check, build, test
+2. **`syntax-check`** — fast-fail strategy tests only
+
+Concurrency control cancels in-flight runs on the same branch. Env placeholders satisfy `@orca/config` Zod validation in CI.
+
+### Database backups
+
+`scripts/backup-db.ps1` — pg_dump custom format with auto-prune.
+- Auto-detects pg_dump from PostgreSQL install dirs (18/17/16/15)
+- Configurable: `ORCA_PG_USER/HOST/DB/PASSWORD/PORT`, `ORCA_BACKUP_DIR`, `ORCA_BACKUP_KEEP` (default 14 days)
+- Run manually or via Windows Task Scheduler
+
+### Operational runbook
+
+`RUNBOOK.md` — 11 scenarios with copy-paste commands:
+1. App won't start  2. Migration failures (advisory locks)  3. Bot stuck RUNNING
+4. Wrong P&L  5. Duplicate orders  6. Network/502 errors  7. Restore from backup
+8. Telegram not arriving  9. Status reports  10. Emergency stop  11. Run tests
+
+---
+
+---
+
 ## 🚀 App Reference
 
 ### `apps/api` (NestJS, port 4000, prefix `/api/v1`)
@@ -672,6 +741,16 @@ API client (`lib/api.ts`):
 | **Kill Switch** | `apps/api/src/modules/bots/bots.service.ts:emergencyStopAll()` |
 | **P&L definitions memory** | `C:\Users\Badr\.claude\projects\c--Users-Badr-OneDrive-Desktop-Trading\memory\pnl_definitions.md` |
 | **Deployment guide** | `DEPLOYMENT.md` |
+| **Strategy mock test ctx** | `packages/strategies/src/__test__/test-utils.ts` |
+| **Strategy unit tests** | `packages/strategies/src/{grid_simple,dca_simple}/strategy.test.ts` |
+| **Notification mapping tests** | `apps/api/src/modules/notifications/event-types.test.ts` |
+| **Vitest workspace** | `vitest.workspace.ts` (root), `packages/strategies/vitest.config.ts`, `apps/api/vitest.config.ts` |
+| **Sentry config (API)** | `apps/api/src/sentry.ts` |
+| **Sentry config (Engine)** | `apps/engine/src/sentry.ts` |
+| **Sentry config (Web)** | `apps/web/sentry.{client,server,edge}.config.ts` |
+| **CI workflow** | `.github/workflows/ci.yml` |
+| **DB backup script** | `scripts/backup-db.ps1` |
+| **Operational runbook** | `RUNBOOK.md` |
 
 ---
 
@@ -694,6 +773,7 @@ API client (`lib/api.ts`):
 - ✅ **Phase 9** (2026-04-30) — **Notifications Pipeline** (NotificationDispatcher, event mapping, Telegram chat ID UX, fill frequency modes including CUSTOM, Periodic Status Reports with bot selector)
 - ✅ **Phase 9.5** (2026-04-30) — **Dashboard + Reports rewrite** (4 KPI tiles, Top Performers, Needs Attention, Cumulative P&L line, Daily P&L bars with per-bar color, sortable per-bot table, per-symbol breakdown, best/worst day)
 - ✅ **DEPLOYMENT.md** — Windows Server production deploy guide (Nginx + win-acme + NSSM)
+- ✅ **Sprint 1 — Safety Net** (2026-04-30) — Vitest 4.1.5 workspace + 39 tests across `grid_simple`/`dca_simple`/`event-types`, Sentry on API/Engine/Web (5 config files), GitHub Actions CI with Postgres 17 service container, `scripts/backup-db.ps1` (pg_dump + auto-prune 14d), `RUNBOOK.md` with 11 operational scenarios
 
 ## 📋 Phases Remaining
 
@@ -715,19 +795,19 @@ API client (`lib/api.ts`):
 - Revenue split (commission to creator)
 - Leaderboard + ratings
 
-### Phase 13 — Production Hardening (~5-7 days)
+### Phase 13 — Production Hardening (~3-5 days remaining)
 - PM2 cluster mode
-- Sentry error tracking
+- ~~Sentry error tracking~~ ✅ done in Sprint 1
 - Datadog/Grafana metrics
 - Per-user rate limiting
 - IP allowlist for admin
 - GDPR data export/delete
 - Privacy + ToS pages
-- Unit tests (strategies, indicators, services)
+- ~~Unit tests (strategies)~~ ✅ done in Sprint 1 (39 tests; can still add indicators + services + integration coverage)
 - Integration tests (bot lifecycle)
 - E2E (Playwright)
-- GitHub Actions CI/CD
-- Automated DB backups
+- ~~GitHub Actions CI/CD~~ ✅ done in Sprint 1
+- ~~Automated DB backups~~ ✅ done in Sprint 1 (Windows pg_dump script; Linux/cloud version still TBD)
 
 ### Optional polish (low priority)
 - WebSocket API (`wss://ws-api.binance.com/ws-api/v3`) for placing orders → ~1-3ms vs ~50-150ms HTTP. Adds complexity (signing, correlation, reconnection).
@@ -871,6 +951,21 @@ PUBLIC_WEB_URL=                     # empty in dev; set to https://yourdomain.co
 # Admin defaults
 ADMIN_DEFAULT_EMAIL=admin@orca.local
 ADMIN_DEFAULT_PASSWORD=ChangeMe123!
+
+# Sentry (optional — all 3 are no-ops if DSN unset)
+SENTRY_DSN_API=
+SENTRY_DSN_ENGINE=
+SENTRY_DSN_WEB=
+SENTRY_TRACES_SAMPLE_RATE=0
+SENTRY_ENVIRONMENT=development
+
+# Backup script (optional — defaults exist)
+ORCA_PG_USER=postgres
+ORCA_PG_PASSWORD=
+ORCA_PG_HOST=localhost
+ORCA_PG_DB=orca
+ORCA_BACKUP_DIR=./backups
+ORCA_BACKUP_KEEP=14
 ```
 
 **Production checklist before deploy:**
@@ -881,6 +976,8 @@ ADMIN_DEFAULT_PASSWORD=ChangeMe123!
 - [ ] Configure `COINPAYMENTS_*` for real payments
 - [ ] Configure `API_CORS_ORIGIN` to production domain
 - [ ] `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_WS_URL` MUST point to public domain (baked into web bundle at build time)
+- [ ] Set `SENTRY_DSN_API`, `SENTRY_DSN_ENGINE`, `SENTRY_DSN_WEB` + `SENTRY_ENVIRONMENT=production`
+- [ ] Schedule `scripts/backup-db.ps1` via Task Scheduler (daily) and verify backup files in `ORCA_BACKUP_DIR`
 - [ ] Use a secrets manager (AWS Secrets Manager, Vault) — don't ship `.env`
 - [ ] Re-encrypt all existing API keys with new `ENCRYPTION_SECRET` (write a migration)
 - [ ] Follow `DEPLOYMENT.md` for Nginx + SSL + Windows Services setup
@@ -971,6 +1068,8 @@ When picking the project back up:
 
 ## 📞 If Something Is Broken
 
+> **First stop: `RUNBOOK.md`** — 11 detailed scenarios with copy-paste recovery commands. The list below is the quick triage.
+
 In order of likelihood:
 
 1. **Stale node process** → `Get-Process node | Stop-Process -Force` then restart
@@ -991,6 +1090,7 @@ In order of likelihood:
 
 - **`RUNNING.md`** — user-facing local dev guide
 - **`DEPLOYMENT.md`** — Windows Server production deployment (Nginx, SSL, NSSM)
+- **`RUNBOOK.md`** — 11 operational scenarios with copy-paste recovery commands
 - **`memory/pnl_definitions.md`** — canonical P&L formulas (in Claude memory dir)
 
 ---

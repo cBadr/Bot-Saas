@@ -56,6 +56,13 @@ const EnvSchema = z.object({
   /** Public-facing web URL — used to build deep-links in Telegram messages. Optional. */
   PUBLIC_WEB_URL: z.string().optional(),
 
+  // ─── Sentry (error tracking) — all optional ───
+  SENTRY_DSN_API: z.string().optional(),
+  SENTRY_DSN_ENGINE: z.string().optional(),
+  SENTRY_DSN_WEB: z.string().optional(),
+  SENTRY_TRACES_SAMPLE_RATE: z.coerce.number().min(0).max(1).default(0.1),
+  SENTRY_ENVIRONMENT: z.string().default('development'),
+
   ENGINE_PORT: numericString(4001),
   ENGINE_MAX_BOTS_PER_WORKER: numericString(10),
 

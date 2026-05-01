@@ -1,4 +1,5 @@
 import 'reflect-metadata';
+import './sentry'; // ← no-op when SENTRY_DSN_ENGINE unset
 import http from 'node:http';
 import Redis from 'ioredis';
 import { env } from '@orca/config';
