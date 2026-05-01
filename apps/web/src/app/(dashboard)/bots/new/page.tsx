@@ -93,11 +93,10 @@ export default function NewBotPage() {
 
   const activeKeys = keys?.filter((k) => k.status === 'ACTIVE') ?? [];
   const selectedStrategy = strategies?.find((s) => s.id === presetStrategyId)
-    ?? strategies?.find((s) => s.builtinKey === 'grid_v1');
+    ?? strategies?.find((s) => s.builtinKey === 'grid_simple');
   const builtinKey = selectedStrategy?.builtinKey;
   const isGrid = builtinKey === 'grid_v1';
   const isGridSimple = builtinKey === 'grid_simple';
-  const isDCA = builtinKey === 'dca_v1';
   const isDcaSimple = builtinKey === 'dca_simple';
   const isMACross = builtinKey === 'ma_cross_v1';
   const isGraph = selectedStrategy?.type === 'CUSTOM' && !isMACross;
@@ -185,10 +184,9 @@ export default function NewBotPage() {
     if (isGrid) return buildGridPreview(w, resolvedAnchor);
     if (isGridSimple) return buildGridSimplePreview(w, marketPrice);
     if (isDcaSimple) return buildDcaSimplePreview(w, marketPrice);
-    if (isDCA) return buildDCAPreview(w);
     if (isMACross) return buildMACrossPreview(w);
     return [];
-  }, [w, isGrid, isGridSimple, isDcaSimple, isDCA, isMACross, resolvedAnchor, marketPrice]);
+  }, [w, isGrid, isGridSimple, isDcaSimple, isMACross, resolvedAnchor, marketPrice]);
 
   const totals = useMemo<{ label: string; value: string }[]>(() => {
     const sumQuote = previewLevels.reduce((s, l) => s + l.quoteAmount, 0);
@@ -270,23 +268,6 @@ export default function NewBotPage() {
       if (data.dsUseCustomStartPrice && data.dsCustomStartPrice) {
         params.customStartPrice = Number(data.dsCustomStartPrice);
       }
-    } else if (isDCA) {
-      params.direction = data.dcaDirection ?? 'BUY';
-      params.totalQuoteInvestment = Number(data.totalQuoteInvestment);
-      params.totalOrders = Number(data.totalOrders ?? 20);
-      if (data.enableTimeGate && data.intervalMinutes) params.intervalMinutes = Number(data.intervalMinutes);
-      if (data.enablePriceGate) {
-        if (data.priceGateMode === 'dollar' && data.minPriceMoveDollar) {
-          params.minPriceMoveDollar = Number(data.minPriceMoveDollar);
-        } else if (data.minPriceMovePct) {
-          params.minPriceMovePct = Number(data.minPriceMovePct);
-        }
-      }
-      if (data.takeProfitPct) params.takeProfitPct = Number(data.takeProfitPct);
-      if (data.stopLossPct) params.stopLossPct = Number(data.stopLossPct);
-      if (!params.intervalMinutes && !params.minPriceMovePct && !params.minPriceMoveDollar) {
-        return toast.error('Enable at least one gate (time, % price, or $ price)');
-      }
     } else if (isMACross) {
       params.fastPeriod = Number(data.fastPeriod ?? 9);
       params.slowPeriod = Number(data.slowPeriod ?? 21);
@@ -337,7 +318,6 @@ export default function NewBotPage() {
         <h1 className="text-3xl font-bold">Create new bot</h1>
         <p className="text-muted-foreground">
           {isGraph ? `Configure a custom-graph bot from "${selectedStrategy?.name}".`
-            : isDCA ? 'Configure a Dollar-Cost Averaging bot.'
             : isMACross ? 'Configure an MA Crossover bot.'
             : 'Configure a Grid Trading bot for Binance.'}
         </p>
@@ -349,13 +329,32 @@ export default function NewBotPage() {
           <Card>
             <CardHeader><CardTitle>Strategy</CardTitle></CardHeader>
             <CardContent className="space-y-3">
-              <select className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-                value={selectedStrategy?.id ?? ''}
-                onChange={(e) => router.push(`/bots/new?strategyId=${e.target.value}`)}>
-                {strategies?.map((s) => (
-                  <option key={s.id} value={s.id}>{s.name} ({s.type})</option>
-                ))}
-              </select>
+              {(() => {
+                const RECOMMENDED = ['grid_simple', 'dca_simple', 'ma_cross_v1'];
+                const recs = (strategies ?? []).filter((s) => s.builtinKey && RECOMMENDED.includes(s.builtinKey))
+                  .sort((a, b) => RECOMMENDED.indexOf(a.builtinKey!) - RECOMMENDED.indexOf(b.builtinKey!));
+                const others = (strategies ?? []).filter((s) => !s.builtinKey || !RECOMMENDED.includes(s.builtinKey));
+                return (
+                  <select className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                    value={selectedStrategy?.id ?? ''}
+                    onChange={(e) => router.push(`/bots/new?strategyId=${e.target.value}`)}>
+                    {recs.length > 0 && (
+                      <optgroup label="Recommended">
+                        {recs.map((s) => (
+                          <option key={s.id} value={s.id}>{s.name} ({s.type})</option>
+                        ))}
+                      </optgroup>
+                    )}
+                    {others.length > 0 && (
+                      <optgroup label="Other">
+                        {others.map((s) => (
+                          <option key={s.id} value={s.id}>{s.name} ({s.type})</option>
+                        ))}
+                      </optgroup>
+                    )}
+                  </select>
+                );
+              })()}
               {selectedStrategy && (
                 <div className="text-xs text-muted-foreground flex items-center gap-2 flex-wrap">
                   <Badge variant={selectedStrategy.visibility === 'BUILTIN' ? 'default' : 'outline'} className="text-[9px]">
@@ -867,80 +866,6 @@ export default function NewBotPage() {
             </Card>
           )}
 
-          {/* ─── DCA (legacy) ─── */}
-          {isDCA && (
-            <Card>
-              <CardHeader>
-                <CardTitle>DCA Configuration</CardTitle>
-                <CardDescription>Direction + flexible gates (time, price, or both).</CardDescription>
-              </CardHeader>
-              <CardContent className="space-y-4">
-                <div className="grid grid-cols-2 gap-4">
-                  <Field label="Direction">
-                    <select className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm" {...register('dcaDirection')}>
-                      <option value="BUY">DCA BUY (accumulate)</option>
-                      <option value="SELL">DCA SELL (distribute)</option>
-                    </select>
-                  </Field>
-                  <Field label="Number of orders">
-                    <Input type="number" min={1} max={1000} {...register('totalOrders', { valueAsNumber: true })} />
-                  </Field>
-                </div>
-                <Field label={`Total ${w.dcaDirection === 'SELL' ? 'value to distribute' : 'investment'} (${quoteAsset})`} hint={balanceHint}>
-                  <Input type="number" step="any" {...register('totalQuoteInvestment', { required: true, valueAsNumber: true })} />
-                </Field>
-
-                <div className="border rounded-md p-3 space-y-3 bg-accent/20">
-                  <div className="text-xs font-semibold uppercase text-muted-foreground">Trigger gates (at least one)</div>
-                  <label className="flex items-center gap-3">
-                    <input type="checkbox" {...register('enableTimeGate')} />
-                    <span className="font-medium text-sm">⏱ Time interval</span>
-                  </label>
-                  {w.enableTimeGate && (
-                    <Field label="Minutes between orders">
-                      <Input type="number" min={1} {...register('intervalMinutes', { valueAsNumber: true })} />
-                    </Field>
-                  )}
-                  <label className="flex items-center gap-3 pt-1">
-                    <input type="checkbox" {...register('enablePriceGate')} />
-                    <span className="font-medium text-sm">📉 Price movement</span>
-                  </label>
-                  {w.enablePriceGate && (
-                    <div className="space-y-2 pl-6">
-                      <div className="flex gap-3 text-xs">
-                        <label className="flex items-center gap-1.5 cursor-pointer">
-                          <input type="radio" value="pct" {...register('priceGateMode')} defaultChecked />
-                          % percentage
-                        </label>
-                        <label className="flex items-center gap-1.5 cursor-pointer">
-                          <input type="radio" value="dollar" {...register('priceGateMode')} />
-                          $ absolute
-                        </label>
-                      </div>
-                      {(w.priceGateMode ?? 'pct') === 'pct' ? (
-                        <Field label={`Minimum % ${w.dcaDirection === 'SELL' ? 'rise' : 'drop'} since last order`}>
-                          <Input type="number" step="any" placeholder="e.g. 1.5" {...register('minPriceMovePct', { valueAsNumber: true })} />
-                        </Field>
-                      ) : (
-                        <Field label={`Minimum $ ${w.dcaDirection === 'SELL' ? 'rise' : 'drop'} since last order`}>
-                          <Input type="number" step="any" placeholder="e.g. 100" {...register('minPriceMoveDollar', { valueAsNumber: true })} />
-                        </Field>
-                      )}
-                    </div>
-                  )}
-                  <p className="text-[10px] text-muted-foreground">
-                    Both checked: requires BOTH gates. Only one: just that gate.
-                  </p>
-                </div>
-
-                <div className="grid grid-cols-2 gap-4">
-                  <Field label="Take profit % (optional)"><Input type="number" step="any" {...register('takeProfitPct', { valueAsNumber: true })} /></Field>
-                  <Field label="Stop loss % (optional)"><Input type="number" step="any" {...register('stopLossPct', { valueAsNumber: true })} /></Field>
-                </div>
-              </CardContent>
-            </Card>
-          )}
-
           {/* ─── MA Cross ─── */}
           {isMACross && (
             <Card>
@@ -1211,34 +1136,6 @@ function buildDcaSimplePreview(w: FormData, marketPrice?: number): PreviewLevel[
       side: counterSide,
     });
   }
-  return out;
-}
-
-function buildDCAPreview(w: FormData): PreviewLevel[] {
-  const N = Number(w.totalOrders ?? 0);
-  const total = Number(w.totalQuoteInvestment);
-  if (!Number.isFinite(N) || N < 1 || !Number.isFinite(total) || total <= 0) return [];
-  const perOrder = total / N;
-  // We don't know future prices; show as a flat band centered on current price
-  // (approximation — actual prices will vary). Use price drop spec if set.
-  const dropPct = Number(w.minPriceMovePct ?? 1);
-  const direction = w.dcaDirection ?? 'BUY';
-  const out: PreviewLevel[] = [];
-  for (let i = 0; i < N; i++) {
-    // Each subsequent order placed at progressively lower (BUY) or higher (SELL) prices
-    const priceFactor = direction === 'BUY'
-      ? 1 - (dropPct / 100) * i
-      : 1 + (dropPct / 100) * i;
-    out.push({
-      index: i,
-      price: priceFactor, // relative — preview will scale around 1
-      quoteAmount: perOrder,
-      baseQty: 0, // not meaningful in relative view
-      side: direction,
-    });
-  }
-  // Convert relative prices into absolute using a placeholder reference of 1.0
-  // The preview component handles auto-scaling, so this still renders nicely.
   return out;
 }
 

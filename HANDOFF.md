@@ -1,6 +1,6 @@
 # 🐋 Orca — Project Handoff & Reference
 
-**Last updated:** 2026-05-02 (post-Sprint 3: Commercial Foundation)
+**Last updated:** 2026-05-02 (post-Sprint 3.5: Strategy cleanup — dca_v1 removed)
 **Owner:** Badr
 **Path:** `c:\Users\Badr\OneDrive\Desktop\Trading\`
 **Repo:** local only, branch `master`
@@ -31,7 +31,7 @@ If anything seems off, see [Known Gotchas](#-known-gotchas--lessons-learned).
 
 A **professional crypto trading SaaS** built on Binance Spot, with:
 
-- **Pre-built strategies:** Grid Simple, DCA Simple, Grid v1 (legacy), DCA v1 (legacy), MA Cross + visual node-based custom strategies
+- **Pre-built strategies:** Grid Simple, DCA Simple, MA Crossover (the three canonical strategies) + Grid v1 (legacy back-compat) + visual node-based custom strategies
 - **Real-time bot execution** via Binance WebSocket API (~50ms fill latency)
 - **Live monitoring suite** — TradingView chart with order overlays, integrity widget, P&L sparkline, cooldown countdown
 - **Cycle-based P&L** — authoritative per-cycle accounting (NOT weighted-avg cost basis)
@@ -185,12 +185,12 @@ Built-in strategies (`builtinKey`):
 
 | Key | Status | Description |
 |-----|--------|-------------|
-| `grid_v1` | **Legacy** | Original grid trading. Kept for back-compat. |
-| **`grid_simple`** | **Recommended** | x2-style symmetric ladder. LIMIT_MAKER, mutex-protected, integrity loop, batch placement. **See [Strategies Deep Dive](#-strategies-deep-dive).** |
-| `dca_v1` | **Legacy/deprecated** | Old DCA with time/price gates. Marked deprecated in seed. |
-| **`dca_simple`** | **Recommended** | x2-style ladder DCA with single dynamic TP/BB, multipliers, cooldown, inactivity-recenter. |
-| `ma_cross_v1` | Active | MA Crossover (golden/death cross) |
-| `graph_v1` | Active | Custom node-based strategies (interprets visual builder graph) |
+| **`grid_simple`** | ✅ **Canonical** | x2-style symmetric ladder. LIMIT_MAKER, mutex-protected, integrity loop, batch placement. **See [Strategies Deep Dive](#-strategies-deep-dive).** |
+| **`dca_simple`** | ✅ **Canonical** | x2-style ladder DCA with single dynamic TP/BB, multipliers, cooldown, inactivity-recenter. |
+| **`ma_cross_v1`** | ✅ **Canonical** | MA Crossover (golden/death cross) with optional TP/SL. |
+| `grid_v1` | Legacy | Original grid trading. Kept only for back-compat with older bots. UI new-bot picker shows it under "Other". |
+| `graph_v1` | Active | Custom node-based strategies (interprets visual builder graph). Not a "competing" strategy — it's the meta engine for user-built ones. |
+| ~~`dca_v1`~~ | ❌ **Removed** (2026-05-02) | Old DCA with time/price gates. Code, seed entry, and DB row deleted. Seed includes a one-time cleanup that stops + deletes any orphan `dca_v1` bots and removes the Strategy row. |
 
 Each strategy implements `Strategy<TParams>` from `base.ts`:
 ```ts
@@ -817,6 +817,7 @@ API client (`lib/api.ts`):
 - ✅ **Sprint 1 — Safety Net** (2026-04-30) — Vitest 4.1.5 workspace + 39 tests across `grid_simple`/`dca_simple`/`event-types`, Sentry on API/Engine/Web (5 config files), GitHub Actions CI with Postgres 17 service container, `scripts/backup-db.ps1` (pg_dump + auto-prune 14d), `RUNBOOK.md` with 11 operational scenarios
 - ✅ **Sprint 2 — Channel expansion** (2026-05-02) — Email via Resend (`email.service.ts`), Discord webhooks per-user (`discord.service.ts`), Web Push / PWA via `web-push` + VAPID + service worker `public/sw.js` + `lib/push.ts`. Added `User.discordWebhookUrl` + `User.pushSubscriptions` (Json), `NotificationChannel.PUSH` enum value, 6 new endpoints (`/users/me/{email,discord,push}/test`, `/users/me/push/{subscribe,unsubscribe}`), 3 new settings cards in `/settings/notifications`
 - ✅ **Sprint 3 — Commercial Foundation** (2026-05-02) — Rewritten landing (hero / 6-feature grid / trust strip / 3-tier pricing teaser / footer), lightweight EN↔AR i18n (`lib/i18n.tsx` provider + `LocaleToggle`, RTL via `dir`, localStorage + cookie), 3 legal pages (`/privacy`, `/terms`, `/gdpr`) sharing `LegalLayout`, 14-day free trial (`User.trialEndsAt` set on register, `TrialBanner` component in dashboard layout — active / ending-soon / expired states linking to `/billing`)
+- ✅ **Sprint 3.5 — Strategy cleanup** (2026-05-02) — Designated **Grid Simple, DCA Simple, MA Crossover** as the three canonical strategies. **Removed `dca_v1` entirely:** deleted `packages/strategies/src/dca/` directory, dropped from registry/index, removed from seed, removed legacy form card + `buildDCAPreview` from new-bot UI, cleaned `bots.service.ts` references. New-bot picker now uses `<optgroup>` to group "Recommended" (the 3 canonical) vs "Other" (legacy). Seed includes idempotent one-time cleanup: stops + deletes any orphan `dca_v1` bots, then removes the Strategy row. `grid_v1` kept but renamed to "Grid Trading (Legacy)" with deprecation notice in description.
 
 ## 📋 Phases Remaining
 

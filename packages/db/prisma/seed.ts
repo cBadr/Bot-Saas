@@ -6,6 +6,26 @@ const prisma = new PrismaClient();
 async function main() {
   console.log('🌱 Seeding database...');
 
+  // ─── One-time cleanup: dca_v1 was removed (Sprint 3.5, 2026-05-02). ───
+  // If a Strategy row with builtinKey='dca_v1' still exists, stop+delete any
+  // referencing bots and remove the row. Idempotent: a no-op once cleaned.
+  const legacyDca = await prisma.strategy.findUnique({ where: { builtinKey: 'dca_v1' } });
+  if (legacyDca) {
+    const orphaned = await prisma.bot.findMany({
+      where: { strategyId: legacyDca.id },
+      select: { id: true, name: true, status: true },
+    });
+    if (orphaned.length > 0) {
+      console.log(`  ⚠ Found ${orphaned.length} bot(s) on removed dca_v1 — stopping and deleting...`);
+      for (const b of orphaned) {
+        await prisma.bot.update({ where: { id: b.id }, data: { status: 'STOPPED', state: undefined } });
+      }
+      await prisma.bot.deleteMany({ where: { strategyId: legacyDca.id } });
+    }
+    await prisma.strategy.delete({ where: { id: legacyDca.id } });
+    console.log('  ✓ Removed legacy dca_v1 strategy');
+  }
+
   // ─── Default Plans ───
   const plans = [
     {
@@ -59,13 +79,13 @@ async function main() {
   }
   console.log(`  ✓ ${plans.length} plans`);
 
-  // ─── Built-in Grid Strategy ───
+  // ─── Built-in Grid Strategy (legacy — Grid Simple is the recommended grid) ───
   await prisma.strategy.upsert({
     where: { builtinKey: 'grid_v1' },
     create: {
-      name: 'Grid Trading',
+      name: 'Grid Trading (Legacy)',
       description:
-        'Classic grid trading with arithmetic or geometric (multiplier) price spacing. Default Orca strategy.',
+        '[Legacy — use Grid Simple] Classic grid with arithmetic or geometric spacing. Kept only for back-compat with older bots; new bots should use Grid Simple.',
       type: 'GRID',
       visibility: 'BUILTIN',
       builtinKey: 'grid_v1',
@@ -91,9 +111,13 @@ async function main() {
         },
       },
     },
-    update: {},
+    update: {
+      name: 'Grid Trading (Legacy)',
+      description:
+        '[Legacy — use Grid Simple] Classic grid with arithmetic or geometric spacing. Kept only for back-compat with older bots; new bots should use Grid Simple.',
+    },
   });
-  console.log('  ✓ Built-in Grid strategy');
+  console.log('  ✓ Built-in Grid strategy (legacy)');
 
   // ─── Grid Simple strategy (x2-style symmetric ladder) ───
   await prisma.strategy.upsert({
@@ -125,39 +149,6 @@ async function main() {
     },
   });
   console.log('  ✓ Built-in Grid Simple strategy');
-
-  // ─── DCA strategy ───
-  await prisma.strategy.upsert({
-    where: { builtinKey: 'dca_v1' },
-    create: {
-      name: 'DCA (Dollar-Cost Averaging)',
-      description:
-        'Periodic BUY (accumulate) or SELL (distribute) with flexible time and/or price gates.',
-      type: 'DCA',
-      visibility: 'BUILTIN',
-      builtinKey: 'dca_v1',
-      version: 2,
-      definition: { engine: 'dca_v1' },
-      paramsSchema: {
-        type: 'object',
-        required: ['totalQuoteInvestment', 'direction'],
-        properties: {
-          direction: { type: 'string', enum: ['BUY', 'SELL'], default: 'BUY' },
-          totalQuoteInvestment: { type: 'number', exclusiveMinimum: 0 },
-          totalOrders: { type: 'integer', minimum: 1, maximum: 1000, default: 20 },
-          intervalMinutes: { type: 'integer', minimum: 1, maximum: 43200 },
-          minPriceMovePct: { type: 'number', minimum: 0.01, maximum: 100 },
-          takeProfitPct: { type: 'number', minimum: 0.1, maximum: 1000 },
-          stopLossPct: { type: 'number', minimum: 0.1, maximum: 100 },
-        },
-      },
-    },
-    update: {
-      description: '[Deprecated — use DCA Simple] Periodic BUY/SELL with time/price gates. Kept for legacy bots.',
-      version: 2,
-    },
-  });
-  console.log('  ✓ Built-in DCA strategy (legacy)');
 
   // ─── DCA Simple strategy (x2-style ladder DCA) ───
   await prisma.strategy.upsert({

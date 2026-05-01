@@ -78,7 +78,7 @@ export class BotsService {
       };
       const params = (b.params ?? {}) as Record<string, unknown>;
       const builtinKey = b.strategy?.builtinKey ?? null;
-      const isAnyDca = builtinKey === 'dca_v1' || builtinKey === 'dca_simple';
+      const isAnyDca = builtinKey === 'dca_simple';
       const dcaDirection = (params.direction === 'SELL' ? 'SELL' : 'BUY');
 
       // ─── Compute signed held inventory for unrealized math ───
@@ -241,9 +241,8 @@ export class BotsService {
     };
 
     const strategyKey = bot.strategy?.builtinKey ?? null;
-    const isDCA = strategyKey === 'dca_v1';
     const isDcaSimple = strategyKey === 'dca_simple';
-    const isAnyDca = isDCA || isDcaSimple;
+    const isAnyDca = isDcaSimple;
     const params = (bot.params ?? {}) as Record<string, unknown>;
     const dcaDirection = (params.direction === 'SELL' ? 'SELL' : 'BUY') as 'BUY' | 'SELL';
 
