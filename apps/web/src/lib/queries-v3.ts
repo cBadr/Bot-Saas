@@ -58,7 +58,7 @@ export const useMarkAllRead = () => {
 export interface NotificationPreference {
   id: string;
   userId: string;
-  channel: 'TELEGRAM' | 'EMAIL' | 'DISCORD' | 'IN_APP';
+  channel: 'TELEGRAM' | 'EMAIL' | 'DISCORD' | 'IN_APP' | 'PUSH';
   eventType: string;
   enabled: boolean;
 }
@@ -75,7 +75,7 @@ export const useSetNotificationPreference = () => {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (input: {
-      channel: 'TELEGRAM' | 'EMAIL' | 'DISCORD' | 'IN_APP';
+      channel: 'TELEGRAM' | 'EMAIL' | 'DISCORD' | 'IN_APP' | 'PUSH';
       eventType: string;
       enabled: boolean;
     }) => apiCall<NotificationPreference>(() => api.patch('/notifications/preferences', input)),

@@ -102,6 +102,7 @@ enum NotificationChannel {
   TELEGRAM
   EMAIL
   DISCORD
+  PUSH
   IN_APP
 }
 
@@ -146,6 +147,15 @@ model User {
 
   telegramChatId  String?
   telegramUsername String?
+
+  /** Discord webhook URL for personal notifications (per-user). */
+  discordWebhookUrl String?
+  /**
+   * Web Push subscriptions (PWA). Array of objects:
+   *   { endpoint: string, keys: { p256dh: string, auth: string }, ua?: string, createdAt: string }
+   * One user may have multiple devices subscribed.
+   */
+  pushSubscriptions Json @default("[]")
 
   // Notification preferences for high-frequency events:
   //   OFF        — never notify on individual fills

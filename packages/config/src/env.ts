@@ -91,6 +91,17 @@ const EnvSchema = z.object({
   TELEGRAM_BOT_TOKEN: z.string().optional().default(''),
   TELEGRAM_DEFAULT_CHAT_ID: z.string().optional().default(''),
 
+  // ─── Email (Resend) ───
+  RESEND_API_KEY: z.string().optional().default(''),
+  RESEND_FROM: z.string().optional().default('Orca <notifications@orca.local>'),
+
+  // ─── Web Push (VAPID) ───
+  VAPID_PUBLIC_KEY: z.string().optional().default(''),
+  VAPID_PRIVATE_KEY: z.string().optional().default(''),
+  VAPID_SUBJECT: z.string().optional().default('mailto:admin@orca.local'),
+  /** Exposed to web client to subscribe via PushManager. Same value as VAPID_PUBLIC_KEY. */
+  NEXT_PUBLIC_VAPID_PUBLIC_KEY: z.string().optional().default(''),
+
   COINPAYMENTS_PUBLIC_KEY: z.string().optional().default(''),
   COINPAYMENTS_PRIVATE_KEY: z.string().optional().default(''),
   COINPAYMENTS_IPN_SECRET: z.string().optional().default(''),

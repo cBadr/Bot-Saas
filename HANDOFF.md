@@ -1,6 +1,6 @@
 # 🐋 Orca — Project Handoff & Reference
 
-**Last updated:** 2026-04-30 (post-Sprint 1: Safety Net)
+**Last updated:** 2026-05-02 (post-Sprint 2: Email + Discord + Push)
 **Owner:** Badr
 **Path:** `c:\Users\Badr\OneDrive\Desktop\Trading\`
 **Repo:** local only, branch `master`
@@ -8,7 +8,8 @@
 
 > Read this file first when resuming work. It captures architecture, conventions,
 > hard-won gotchas, and the full implementation history of the trading-engine
-> rewrite (Apr 27–30, 2026) plus the Safety Net (tests + Sentry + CI + backups + runbook).
+> rewrite (Apr 27–30, 2026), the Safety Net (tests + Sentry + CI + backups + runbook),
+> and Sprint 2 channel expansion (Email via Resend, Discord webhooks, Web Push / PWA).
 
 ---
 
@@ -34,7 +35,7 @@ A **professional crypto trading SaaS** built on Binance Spot, with:
 - **Live monitoring suite** — TradingView chart with order overlays, integrity widget, P&L sparkline, cooldown countdown
 - **Cycle-based P&L** — authoritative per-cycle accounting (NOT weighted-avg cost basis)
 - **Paper trading** + Backtesting against real historical data
-- **Multi-channel notifications:** in-app inbox + Telegram (with retry, custom rules, periodic status digests)
+- **Multi-channel notifications:** in-app inbox + Telegram + Email (Resend) + Discord webhooks + Web Push (PWA) — with custom rules, fill-frequency modes, and periodic status digests
 - **Risk management:** daily loss limit, max drawdown auto-stop, kill switch
 - **Multi-tenant:** users, API keys, subscriptions
 - **CoinPayments crypto subscriptions**
@@ -385,11 +386,37 @@ Most events emit from strategies via `ctx.emit()`. **Risk events (`RISK_DAILY_LO
 - Update `User.lastStatusReportAt` on success
 - Manual trigger: `POST /status-report/send-now`
 
-### Per-user Telegram setup
+### Per-user channel setup
 
-- `User.telegramChatId` — set via `PATCH /users/me` (UI in `/settings/notifications`)
-- `POST /users/me/telegram/test` — sends test message
-- Settings UI shows live test button + chat ID input + frequency selector
+| Channel | User field | Configure | Test endpoint |
+|---------|-----------|-----------|---------------|
+| Telegram | `User.telegramChatId` | `PATCH /users/me` | `POST /users/me/telegram/test` |
+| Email | `User.email` (verified at signup) | server-side `RESEND_API_KEY` | `POST /users/me/email/test` |
+| Discord | `User.discordWebhookUrl` | `PATCH /users/me` | `POST /users/me/discord/test` |
+| Web Push | `User.pushSubscriptions` (array) | `POST /users/me/push/subscribe` (browser PushManager) | `POST /users/me/push/test` |
+| In-app | n/a (always available) | preference toggle | `GET /notifications/inbox` |
+
+All five channels are dispatched from `NotificationsService.notify()` based on per-user `NotificationPreference` rows. The dispatcher logs every send attempt to `NotificationLog` (success + error string).
+
+### Email (Resend) — `email.service.ts`
+
+- POSTs to `https://api.resend.com/emails` via `undici`
+- Renders branded HTML wrapper around plain-text body (subject + content)
+- Returns false (no throw) when `RESEND_API_KEY` is unset — graceful degrade
+
+### Discord — `discord.service.ts`
+
+- Per-user webhook URL stored on `User.discordWebhookUrl`
+- Validates URL pattern (`^https://(canary\.|ptb\.)?discord(app)?\.com/api/webhooks/`)
+- Sends as embed (title + description + Orca brand color `#60a5fa`), truncates body to 4000 chars
+
+### Web Push — `web-push.service.ts`
+
+- Uses `web-push` npm package with VAPID keys (`VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, `VAPID_SUBJECT`)
+- Browser side: `apps/web/src/lib/push.ts` registers `/sw.js`, calls `pushManager.subscribe`, posts subscription JSON to `/users/me/push/subscribe`
+- Service worker `apps/web/public/sw.js` shows OS notification, navigates to `data.url` on click
+- Auto-prunes endpoints returning 404/410 (expired subscriptions)
+- One user can have multiple devices (mobile, laptop, etc.) — push fan-out is per-device
 
 ---
 
@@ -730,6 +757,11 @@ API client (`lib/api.ts`):
 | **Notification routing** | `apps/api/src/modules/notifications/notification-dispatcher.service.ts` |
 | **Notification event mapping** | `apps/api/src/modules/notifications/event-types.ts` |
 | **Telegram client** | `apps/api/src/modules/notifications/telegram.service.ts` |
+| **Email (Resend) client** | `apps/api/src/modules/notifications/email.service.ts` |
+| **Discord webhook client** | `apps/api/src/modules/notifications/discord.service.ts` |
+| **Web Push (VAPID) service** | `apps/api/src/modules/notifications/web-push.service.ts` |
+| **Push browser helper** | `apps/web/src/lib/push.ts` |
+| **Push service worker** | `apps/web/public/sw.js` |
 | **Periodic status reports** | `apps/api/src/modules/status-report/status-report.service.ts` |
 | **Wallet (manual trading)** | `apps/api/src/modules/wallet/`, `apps/web/src/app/(dashboard)/wallet/page.tsx` |
 | **CoinPayments client** | `apps/api/src/modules/payments/coinpayments.client.ts` |
@@ -774,13 +806,15 @@ API client (`lib/api.ts`):
 - ✅ **Phase 9.5** (2026-04-30) — **Dashboard + Reports rewrite** (4 KPI tiles, Top Performers, Needs Attention, Cumulative P&L line, Daily P&L bars with per-bar color, sortable per-bot table, per-symbol breakdown, best/worst day)
 - ✅ **DEPLOYMENT.md** — Windows Server production deploy guide (Nginx + win-acme + NSSM)
 - ✅ **Sprint 1 — Safety Net** (2026-04-30) — Vitest 4.1.5 workspace + 39 tests across `grid_simple`/`dca_simple`/`event-types`, Sentry on API/Engine/Web (5 config files), GitHub Actions CI with Postgres 17 service container, `scripts/backup-db.ps1` (pg_dump + auto-prune 14d), `RUNBOOK.md` with 11 operational scenarios
+- ✅ **Sprint 2 — Channel expansion** (2026-05-02) — Email via Resend (`email.service.ts`), Discord webhooks per-user (`discord.service.ts`), Web Push / PWA via `web-push` + VAPID + service worker `public/sw.js` + `lib/push.ts`. Added `User.discordWebhookUrl` + `User.pushSubscriptions` (Json), `NotificationChannel.PUSH` enum value, 6 new endpoints (`/users/me/{email,discord,push}/test`, `/users/me/push/{subscribe,unsubscribe}`), 3 new settings cards in `/settings/notifications`
 
 ## 📋 Phases Remaining
 
-### Phase 10 — Notification channels expansion (~3-4 days)
-- Email via Resend or SMTP (templates, daily P&L summary)
-- Discord webhooks
-- Push notifications (PWA service worker)
+### Phase 10 — Notification channels expansion ✅ done in Sprint 2
+- ~~Email via Resend~~ ✅
+- ~~Discord webhooks~~ ✅
+- ~~Push notifications (PWA service worker)~~ ✅
+- (Optional polish: HTML templates per event type, daily P&L summary email, SMTP fallback)
 
 ### Phase 11 — Multi-Exchange (~5-8 days)
 - Bybit, OKX, KuCoin connectors
@@ -959,6 +993,17 @@ SENTRY_DSN_WEB=
 SENTRY_TRACES_SAMPLE_RATE=0
 SENTRY_ENVIRONMENT=development
 
+# Resend (Email) — optional
+RESEND_API_KEY=
+RESEND_FROM=Orca <notifications@orca.local>
+
+# Web Push (VAPID) — optional. Generate via:
+#   npx web-push generate-vapid-keys
+VAPID_PUBLIC_KEY=
+VAPID_PRIVATE_KEY=
+VAPID_SUBJECT=mailto:admin@orca.local
+NEXT_PUBLIC_VAPID_PUBLIC_KEY=     # MUST equal VAPID_PUBLIC_KEY (baked into web build)
+
 # Backup script (optional — defaults exist)
 ORCA_PG_USER=postgres
 ORCA_PG_PASSWORD=
@@ -977,6 +1022,8 @@ ORCA_BACKUP_KEEP=14
 - [ ] Configure `API_CORS_ORIGIN` to production domain
 - [ ] `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_WS_URL` MUST point to public domain (baked into web bundle at build time)
 - [ ] Set `SENTRY_DSN_API`, `SENTRY_DSN_ENGINE`, `SENTRY_DSN_WEB` + `SENTRY_ENVIRONMENT=production`
+- [ ] Configure `RESEND_API_KEY` + `RESEND_FROM` (verified domain) for email notifications
+- [ ] Generate VAPID keys (`npx web-push generate-vapid-keys`); set `VAPID_PUBLIC_KEY` + `VAPID_PRIVATE_KEY` + `NEXT_PUBLIC_VAPID_PUBLIC_KEY` (last must match server public). Web Push REQUIRES HTTPS.
 - [ ] Schedule `scripts/backup-db.ps1` via Task Scheduler (daily) and verify backup files in `ORCA_BACKUP_DIR`
 - [ ] Use a secrets manager (AWS Secrets Manager, Vault) — don't ship `.env`
 - [ ] Re-encrypt all existing API keys with new `ENCRYPTION_SECRET` (write a migration)

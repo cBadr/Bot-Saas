@@ -6,7 +6,7 @@ import { ZodValidationPipe } from '../../common/pipes/zod.pipe';
 import { NotificationsService } from './notifications.service';
 
 const PrefDto = z.object({
-  channel: z.enum(['TELEGRAM', 'EMAIL', 'DISCORD', 'IN_APP']),
+  channel: z.enum(['TELEGRAM', 'EMAIL', 'DISCORD', 'PUSH', 'IN_APP']),
   eventType: z.string().min(1),
   enabled: z.boolean(),
 });

@@ -19,6 +19,8 @@ export interface User {
   id: string; email: string; fullName?: string | null; avatarUrl?: string | null;
   role: string; status: string; twoFactorEnabled: boolean;
   telegramChatId?: string | null; telegramUsername?: string | null;
+  discordWebhookUrl?: string | null;
+  pushSubscriptions?: Array<{ endpoint: string; ua?: string; createdAt?: string }>;
   fillFrequency?: FillFrequency;
   notificationConfig?: NotificationConfig | null;
   lastStatusReportAt?: string | null;
@@ -41,6 +43,7 @@ export const useUpdateProfile = () => {
       fullName?: string;
       telegramChatId?: string | null;
       telegramUsername?: string | null;
+      discordWebhookUrl?: string | null;
       fillFrequency?: FillFrequency;
       notificationConfig?: NotificationConfig;
     }) => apiCall<User>(() => api.patch('/users/me', input)),
@@ -53,6 +56,39 @@ export const useTestTelegram = () =>
   useMutation({
     mutationFn: () => apiCall<{ ok: true }>(() => api.post('/users/me/telegram/test', {})),
   });
+
+export const useTestEmail = () =>
+  useMutation({
+    mutationFn: () => apiCall<{ ok: true }>(() => api.post('/users/me/email/test', {})),
+  });
+
+export const useTestDiscord = () =>
+  useMutation({
+    mutationFn: () => apiCall<{ ok: true }>(() => api.post('/users/me/discord/test', {})),
+  });
+
+export const useTestPush = () =>
+  useMutation({
+    mutationFn: () => apiCall<{ sent: number; failed: number }>(() => api.post('/users/me/push/test', {})),
+  });
+
+export const useSubscribePush = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (sub: { endpoint: string; keys: { p256dh: string; auth: string }; ua?: string }) =>
+      apiCall<{ ok: true }>(() => api.post('/users/me/push/subscribe', sub)),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['me'] }),
+  });
+};
+
+export const useUnsubscribePush = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (endpoint: string) =>
+      apiCall<{ ok: true }>(() => api.post('/users/me/push/unsubscribe', { endpoint })),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['me'] }),
+  });
+};
 
 /**
  * Manually fire a status report immediately (preview the periodic report).

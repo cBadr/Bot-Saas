@@ -17,10 +17,28 @@ const UpdateProfileDto = z.object({
   avatarUrl: z.string().url().optional(),
   telegramChatId: z.string().nullable().optional(),
   telegramUsername: z.string().nullable().optional(),
+  discordWebhookUrl: z
+    .string()
+    .url()
+    .regex(/^https:\/\/(canary\.|ptb\.)?discord(app)?\.com\/api\/webhooks\//, {
+      message: 'Must be a Discord webhook URL',
+    })
+    .nullable()
+    .optional(),
   fillFrequency: z.enum(['OFF', 'PER_CYCLE', 'PER_FILL', 'CUSTOM']).optional(),
   notificationConfig: NotificationConfigDto.optional(),
 });
 type UpdateProfileDto = z.infer<typeof UpdateProfileDto>;
+
+const PushSubscriptionDto = z.object({
+  endpoint: z.string().url(),
+  keys: z.object({
+    p256dh: z.string().min(1),
+    auth: z.string().min(1),
+  }),
+  ua: z.string().optional(),
+});
+type PushSubscriptionDto = z.infer<typeof PushSubscriptionDto>;
 
 const ChangePasswordDto = z.object({
   currentPassword: z.string().min(1),
@@ -76,5 +94,36 @@ export class UsersController {
   @Post('me/telegram/test')
   testTelegram(@CurrentUser() u: CurrentUserPayload) {
     return this.users.sendTestTelegram(u.sub);
+  }
+
+  @Post('me/email/test')
+  testEmail(@CurrentUser() u: CurrentUserPayload) {
+    return this.users.sendTestEmail(u.sub);
+  }
+
+  @Post('me/discord/test')
+  testDiscord(@CurrentUser() u: CurrentUserPayload) {
+    return this.users.sendTestDiscord(u.sub);
+  }
+
+  @Post('me/push/test')
+  testPush(@CurrentUser() u: CurrentUserPayload) {
+    return this.users.sendTestPush(u.sub);
+  }
+
+  @Post('me/push/subscribe')
+  subscribePush(
+    @CurrentUser() u: CurrentUserPayload,
+    @Body(new ZodValidationPipe(PushSubscriptionDto)) dto: PushSubscriptionDto,
+  ) {
+    return this.users.addPushSubscription(u.sub, dto);
+  }
+
+  @Post('me/push/unsubscribe')
+  unsubscribePush(
+    @CurrentUser() u: CurrentUserPayload,
+    @Body(new ZodValidationPipe(z.object({ endpoint: z.string().url() }))) dto: { endpoint: string },
+  ) {
+    return this.users.removePushSubscription(u.sub, dto.endpoint);
   }
 }

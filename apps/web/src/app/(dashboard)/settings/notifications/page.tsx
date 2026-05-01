@@ -3,16 +3,19 @@ import { useEffect, useState } from 'react';
 import { toast } from 'sonner';
 import { useNotificationPreferences, useSetNotificationPreference } from '@/lib/queries-v3';
 import {
-  useMe, useUpdateProfile, useTestTelegram, useSendStatusReportNow, useBots,
+  useMe, useUpdateProfile, useTestTelegram, useTestEmail, useTestDiscord,
+  useTestPush, useSubscribePush, useUnsubscribePush,
+  useSendStatusReportNow, useBots,
   type FillFrequency, type NotificationConfig,
 } from '@/lib/queries';
+import { isPushSupported, isPushConfigured, subscribeForPush, unsubscribeFromPush } from '@/lib/push';
 import { formatDuration } from '@/lib/utils';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { ArrowLeft, Send, MessageCircle, Bell, FileText, Clock } from 'lucide-react';
+import { ArrowLeft, Send, MessageCircle, Bell, FileText, Clock, Mail, Webhook, BellRing } from 'lucide-react';
 import Link from 'next/link';
 
 const EVENTS: { key: string; label: string; desc: string }[] = [
@@ -28,11 +31,12 @@ const EVENTS: { key: string; label: string; desc: string }[] = [
   { key: 'STATUS_REPORT', label: 'Periodic status report', desc: 'Scheduled comprehensive report (configured above).' },
 ];
 
-const CHANNELS: { key: 'IN_APP' | 'TELEGRAM' | 'EMAIL' | 'DISCORD'; label: string }[] = [
+const CHANNELS: { key: 'IN_APP' | 'TELEGRAM' | 'EMAIL' | 'DISCORD' | 'PUSH'; label: string }[] = [
   { key: 'IN_APP', label: 'In-app' },
   { key: 'TELEGRAM', label: 'Telegram' },
   { key: 'EMAIL', label: 'Email' },
   { key: 'DISCORD', label: 'Discord' },
+  { key: 'PUSH', label: 'Push' },
 ];
 
 const FREQUENCY_OPTIONS: { key: FillFrequency; label: string; desc: string }[] = [
@@ -48,6 +52,52 @@ export default function NotificationPreferencesPage() {
   const setPref = useSetNotificationPreference();
   const updateProfile = useUpdateProfile();
   const testTelegram = useTestTelegram();
+  const testEmail = useTestEmail();
+  const testDiscord = useTestDiscord();
+  const testPush = useTestPush();
+  const subscribePush = useSubscribePush();
+  const unsubscribePush = useUnsubscribePush();
+  const [discordUrl, setDiscordUrl] = useState<string>('');
+  useEffect(() => {
+    if (me?.discordWebhookUrl !== undefined) setDiscordUrl(me.discordWebhookUrl ?? '');
+  }, [me?.discordWebhookUrl]);
+  const discordSaved = (me?.discordWebhookUrl ?? '') === discordUrl.trim();
+  const saveDiscordUrl = () => {
+    const trimmed = discordUrl.trim();
+    updateProfile.mutate(
+      { discordWebhookUrl: trimmed === '' ? null : trimmed },
+      {
+        onSuccess: () => toast.success(trimmed === '' ? 'Discord cleared' : 'Discord webhook saved'),
+        onError: (e) => toast.error(e.message),
+      },
+    );
+  };
+  const pushSubs = me?.pushSubscriptions ?? [];
+  const pushAvailable = isPushSupported() && isPushConfigured();
+  const enablePush = async () => {
+    try {
+      const sub = await subscribeForPush();
+      subscribePush.mutate(sub, {
+        onSuccess: () => toast.success('Browser notifications enabled'),
+        onError: (e) => toast.error(e.message),
+      });
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    }
+  };
+  const disablePush = async () => {
+    try {
+      const endpoint = await unsubscribeFromPush();
+      if (endpoint) {
+        unsubscribePush.mutate(endpoint, {
+          onSuccess: () => toast.success('Browser notifications disabled'),
+          onError: (e) => toast.error(e.message),
+        });
+      }
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   // Local edit buffer for chat ID so user can edit without instant save spam
   const [chatId, setChatId] = useState<string>('');
@@ -61,7 +111,7 @@ export default function NotificationPreferencesPage() {
     return p.enabled;
   };
 
-  const toggle = (channel: 'IN_APP' | 'TELEGRAM' | 'EMAIL' | 'DISCORD', event: string, current: boolean) => {
+  const toggle = (channel: 'IN_APP' | 'TELEGRAM' | 'EMAIL' | 'DISCORD' | 'PUSH', event: string, current: boolean) => {
     setPref.mutate(
       { channel, eventType: event, enabled: !current },
       {
@@ -259,6 +309,130 @@ export default function NotificationPreferencesPage() {
               </p>
             )}
           </div>
+        </CardContent>
+      </Card>
+
+      {/* ─── Email (Resend) ─── */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base flex items-center gap-2">
+            <Mail className="h-4 w-4 text-primary" />
+            Email
+          </CardTitle>
+          <CardDescription>
+            Sent to <code className="text-foreground">{me?.email}</code> via the configured Resend
+            account on the server. Enable the EMAIL channel below for the events you care about.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <Button
+            variant="outline"
+            onClick={() => testEmail.mutate(undefined, {
+              onSuccess: () => toast.success('Test email sent — check your inbox!'),
+              onError: (e) => toast.error(e.message),
+            })}
+            disabled={testEmail.isPending}
+          >
+            <Send className="h-4 w-4" />
+            {testEmail.isPending ? 'Sending…' : 'Send test email'}
+          </Button>
+        </CardContent>
+      </Card>
+
+      {/* ─── Discord webhook ─── */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base flex items-center gap-2">
+            <Webhook className="h-4 w-4 text-primary" />
+            Discord webhook
+          </CardTitle>
+          <CardDescription>
+            In your Discord server: Channel settings → Integrations → Webhooks → New Webhook → Copy
+            URL. Paste it below to receive Orca alerts as embedded messages.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="grid gap-2">
+            <Label htmlFor="discordUrl">Webhook URL</Label>
+            <div className="flex gap-2">
+              <Input
+                id="discordUrl"
+                type="url"
+                placeholder="https://discord.com/api/webhooks/..."
+                value={discordUrl}
+                onChange={(e) => setDiscordUrl(e.target.value)}
+                className="font-mono text-xs"
+              />
+              <Button
+                onClick={saveDiscordUrl}
+                disabled={updateProfile.isPending || discordSaved}
+                variant={discordSaved ? 'outline' : 'default'}
+              >
+                {discordSaved ? 'Saved' : 'Save'}
+              </Button>
+              <Button
+                onClick={() => testDiscord.mutate(undefined, {
+                  onSuccess: () => toast.success('Test sent to Discord!'),
+                  onError: (e) => toast.error(e.message),
+                })}
+                variant="outline"
+                disabled={testDiscord.isPending || !me?.discordWebhookUrl || !discordSaved}
+              >
+                <Send className="h-4 w-4" />
+                Test
+              </Button>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* ─── Browser push ─── */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base flex items-center gap-2">
+            <BellRing className="h-4 w-4 text-primary" />
+            Browser push
+          </CardTitle>
+          <CardDescription>
+            {!isPushSupported()
+              ? 'Your browser does not support web push notifications.'
+              : !isPushConfigured()
+                ? 'Web push is not configured on the server (NEXT_PUBLIC_VAPID_PUBLIC_KEY missing).'
+                : 'Enable to receive push notifications even when the tab is closed (PWA-style).'}
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="flex flex-wrap gap-2 items-center">
+            <Button
+              onClick={enablePush}
+              disabled={!pushAvailable || subscribePush.isPending}
+            >
+              {subscribePush.isPending ? 'Enabling…' : 'Enable on this device'}
+            </Button>
+            <Button
+              variant="outline"
+              onClick={disablePush}
+              disabled={!pushAvailable || unsubscribePush.isPending || pushSubs.length === 0}
+            >
+              Disable on this device
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => testPush.mutate(undefined, {
+                onSuccess: (r) => toast.success(`Test sent to ${r.sent} device${r.sent === 1 ? '' : 's'}`),
+                onError: (e) => toast.error(e.message),
+              })}
+              disabled={testPush.isPending || pushSubs.length === 0}
+            >
+              <Send className="h-4 w-4" />
+              Test
+            </Button>
+          </div>
+          {pushSubs.length > 0 && (
+            <p className="text-[11px] text-muted-foreground">
+              {pushSubs.length} device{pushSubs.length === 1 ? '' : 's'} subscribed.
+            </p>
+          )}
         </CardContent>
       </Card>
 

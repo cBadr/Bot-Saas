@@ -1,6 +1,9 @@
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { TelegramService } from './telegram.service';
+import { EmailService } from './email.service';
+import { DiscordService } from './discord.service';
+import { WebPushService } from './web-push.service';
 
 export type NotificationEvent =
   | 'BOT_STARTED' | 'BOT_STOPPED' | 'BOT_ERROR'
@@ -17,11 +20,16 @@ export const ALL_NOTIFICATION_EVENTS: NotificationEvent[] = [
   'STATUS_REPORT',
 ];
 
+export type NotificationChannel = 'TELEGRAM' | 'EMAIL' | 'DISCORD' | 'PUSH' | 'IN_APP';
+
 @Injectable()
 export class NotificationsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly telegram: TelegramService,
+    private readonly email: EmailService,
+    private readonly discord: DiscordService,
+    private readonly push: WebPushService,
   ) {}
 
   async notify(userId: string, event: NotificationEvent, message: string, data?: Record<string, unknown>) {
@@ -30,10 +38,15 @@ export class NotificationsService {
     });
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
-      select: { telegramChatId: true },
+      select: { telegramChatId: true, email: true, discordWebhookUrl: true },
     });
 
-    const channels = prefs.length ? prefs.map((p) => p.channel) : (['IN_APP', 'TELEGRAM'] as const);
+    const channels: NotificationChannel[] = prefs.length
+      ? (prefs.map((p) => p.channel) as NotificationChannel[])
+      : ['IN_APP', 'TELEGRAM'];
+
+    const title = (data?.title as string | undefined) ?? this.titleFor(event);
+    const url = (data?.url as string | undefined) ?? undefined;
 
     for (const channel of channels) {
       let success = false;
@@ -41,6 +54,13 @@ export class NotificationsService {
       try {
         if (channel === 'TELEGRAM' && user?.telegramChatId) {
           success = await this.telegram.send(user.telegramChatId, `🐋 *Orca*\n${message}`);
+        } else if (channel === 'EMAIL' && user?.email) {
+          success = await this.email.send(user.email, title, message);
+        } else if (channel === 'DISCORD' && user?.discordWebhookUrl) {
+          success = await this.discord.send(user.discordWebhookUrl, message, { title });
+        } else if (channel === 'PUSH') {
+          const r = await this.push.sendToUser(userId, { title, body: message, url, tag: event });
+          success = r.sent > 0;
         } else if (channel === 'IN_APP') {
           success = true;
         }
@@ -60,11 +80,27 @@ export class NotificationsService {
     }
   }
 
+  private titleFor(event: NotificationEvent): string {
+    switch (event) {
+      case 'BOT_STARTED': return '✅ Bot started';
+      case 'BOT_STOPPED': return '🛑 Bot stopped';
+      case 'BOT_ERROR': return '⚠️ Bot error';
+      case 'ORDER_FILLED': return '📈 Order filled';
+      case 'CYCLE_COMPLETED': return '🎯 Cycle completed';
+      case 'TAKE_PROFIT_HIT': return '💰 Take profit hit';
+      case 'STOP_LOSS_HIT': return '🛡️ Stop loss hit';
+      case 'PAYMENT_RECEIVED': return '💳 Payment received';
+      case 'SUBSCRIPTION_EXPIRING': return '⏰ Subscription expiring';
+      case 'STATUS_REPORT': return '📊 Orca status report';
+      default: return '🐋 Orca';
+    }
+  }
+
   async listPreferences(userId: string) {
     return this.prisma.notificationPreference.findMany({ where: { userId } });
   }
 
-  async setPreference(userId: string, channel: 'TELEGRAM' | 'EMAIL' | 'DISCORD' | 'IN_APP', eventType: string, enabled: boolean) {
+  async setPreference(userId: string, channel: NotificationChannel, eventType: string, enabled: boolean) {
     return this.prisma.notificationPreference.upsert({
       where: { userId_channel_eventType: { userId, channel, eventType } },
       create: { userId, channel, eventType, enabled },
