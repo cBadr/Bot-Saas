@@ -1,6 +1,6 @@
 import axios, { type AxiosInstance } from 'axios';
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'https://orcax.click/api/v1';
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000/api/v1';
 
 export interface ApiResponse<T> { ok: boolean; data?: T; error?: { code: string; message: string; details?: unknown } }
 
