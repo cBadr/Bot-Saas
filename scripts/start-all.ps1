@@ -88,9 +88,9 @@ Start-Sleep -Seconds 15
 Write-Host ""
 Write-Host "  Verifying services are responding..." -ForegroundColor Yellow
 $endpoints = @(
-    @{ name = "API";    url = "http://localhost:4000/api/v1/health" },
+    @{ name = "API";    url = "https://orcax.click/api/v1/health" },
     @{ name = "Engine"; url = "http://localhost:4001/health" },
-    @{ name = "Web";    url = "http://localhost:3000/" }
+    @{ name = "Web";    url = "https://orcax.click/" }
 )
 foreach ($e in $endpoints) {
     try {
@@ -107,6 +107,6 @@ foreach ($e in $endpoints) {
 }
 
 Write-Host ""
-Write-Host "  Open http://localhost:3000" -ForegroundColor Cyan
+Write-Host "  Open https://orcax.click" -ForegroundColor Cyan
 Write-Host "  Default admin: admin@orca.local / ChangeMe123!" -ForegroundColor Cyan
 Write-Host ""
