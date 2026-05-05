@@ -51,8 +51,8 @@ const EnvSchema = z.object({
   API_CORS_ORIGIN: z.string().default('http://localhost:3000'),
 
   WEB_PORT: numericString(3000),
-  NEXT_PUBLIC_API_URL: z.string().default('http://localhost:4000/api/v1'),
-  NEXT_PUBLIC_WS_URL: z.string().default('ws://localhost:4000'),
+  NEXT_PUBLIC_API_URL: z.string().default('https://orcax.click/api/v1'),
+  NEXT_PUBLIC_WS_URL: z.string().default('wss://orcax.click'),
   /** Public-facing web URL — used to build deep-links in Telegram messages. Optional. */
   PUBLIC_WEB_URL: z.string().optional(),
 

@@ -61,7 +61,7 @@ export function ConnectionStatus() {
                   <XCircle className="h-4 w-4" />
                   <span className="text-sm font-medium">API server is unreachable</span>
                 </div>
-                <p className="text-xs text-muted-foreground">{data?.error ?? 'Cannot connect to localhost:4000'}</p>
+                <p className="text-xs text-muted-foreground">{data?.error ?? 'Cannot connect to API'}</p>
                 <div className="rounded-md bg-muted p-2 text-xs font-mono">
                   <p className="text-muted-foreground mb-1"># Start it from the project root:</p>
                   <p>pnpm start:all</p>
