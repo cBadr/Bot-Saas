@@ -717,12 +717,144 @@ export default function NotificationPreferencesPage() {
         </CardContent>
       </Card>
 
+      {/* ─── Advanced delivery rules ─── */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Delivery rules</CardTitle>
+          <CardDescription>
+            Mute specific bots, batch notifications into digests, set quiet hours, and filter by severity.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-5">
+          {/* Per-bot mute */}
+          <div>
+            <Label className="text-xs uppercase tracking-wide">Muted bots</Label>
+            <p className="text-[11px] text-muted-foreground mb-2">No notifications from these bots (any channel, any event).</p>
+            {(bots?.length ?? 0) === 0 ? (
+              <p className="text-xs italic text-muted-foreground">No bots yet.</p>
+            ) : (
+              <div className="grid gap-1 sm:grid-cols-2 max-h-[180px] overflow-y-auto rounded-md border p-2">
+                {bots!.map((b) => {
+                  const muted = (cfg.mutedBotIds ?? []).includes(b.id);
+                  return (
+                    <label key={b.id} className="flex items-center gap-2 text-xs cursor-pointer hover:bg-muted/30 rounded px-1 py-0.5">
+                      <input
+                        type="checkbox"
+                        checked={muted}
+                        onChange={(e) => {
+                          const ids = new Set(cfg.mutedBotIds ?? []);
+                          if (e.target.checked) ids.add(b.id); else ids.delete(b.id);
+                          updateProfile.mutate(
+                            { notificationConfig: { ...cfg, mutedBotIds: [...ids] } },
+                            { onError: (er) => toast.error(er.message) },
+                          );
+                        }}
+                      />
+                      <span className="truncate">{b.name}</span>
+                      <Badge variant="outline" className="text-[9px] font-mono ml-auto">{b.symbol}</Badge>
+                    </label>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Digest mode */}
+          <div>
+            <Label htmlFor="digest" className="text-xs uppercase tracking-wide">Digest interval</Label>
+            <p className="text-[11px] text-muted-foreground mb-1">
+              Batch fill notifications and send them periodically instead of one-by-one. 0 = send immediately.
+            </p>
+            <select
+              id="digest"
+              className="h-9 px-2 rounded-md border bg-background text-sm"
+              value={cfg.digestIntervalMinutes ?? 0}
+              onChange={(e) => updateProfile.mutate(
+                { notificationConfig: { ...cfg, digestIntervalMinutes: Number(e.target.value) } },
+                { onSuccess: () => toast.success('Digest updated'), onError: (er) => toast.error(er.message) },
+              )}>
+              <option value="0">Off (immediate)</option>
+              <option value="5">Every 5 minutes</option>
+              <option value="15">Every 15 minutes</option>
+              <option value="60">Every hour</option>
+              <option value="240">Every 4 hours</option>
+              <option value="1440">Daily</option>
+            </select>
+            <p className="text-[10px] text-muted-foreground italic mt-1">
+              Critical events (bot errors, payment failures) bypass digest.
+            </p>
+          </div>
+
+          {/* Quiet hours */}
+          <div>
+            <Label className="text-xs uppercase tracking-wide">Quiet hours</Label>
+            <p className="text-[11px] text-muted-foreground mb-1">
+              Suppress non-critical notifications during these hours.
+            </p>
+            <div className="flex items-center gap-2 flex-wrap">
+              <input
+                type="time"
+                value={cfg.quietHours?.start ?? ''}
+                onChange={(e) => updateProfile.mutate(
+                  { notificationConfig: { ...cfg, quietHours: { start: e.target.value, end: cfg.quietHours?.end ?? '07:00', tz: cfg.quietHours?.tz } } },
+                  { onError: (er) => toast.error(er.message) },
+                )}
+                className="h-9 px-2 rounded-md border bg-background text-sm font-mono"
+              />
+              <span className="text-xs text-muted-foreground">to</span>
+              <input
+                type="time"
+                value={cfg.quietHours?.end ?? ''}
+                onChange={(e) => updateProfile.mutate(
+                  { notificationConfig: { ...cfg, quietHours: { start: cfg.quietHours?.start ?? '23:00', end: e.target.value, tz: cfg.quietHours?.tz } } },
+                  { onError: (er) => toast.error(er.message) },
+                )}
+                className="h-9 px-2 rounded-md border bg-background text-sm font-mono"
+              />
+              {cfg.quietHours && (
+                <Button size="sm" variant="ghost"
+                  onClick={() => updateProfile.mutate(
+                    { notificationConfig: { ...cfg, quietHours: null } },
+                    { onSuccess: () => toast.success('Quiet hours cleared') },
+                  )}>
+                  Clear
+                </Button>
+              )}
+            </div>
+          </div>
+
+          {/* Severity filter */}
+          <div>
+            <Label htmlFor="severity" className="text-xs uppercase tracking-wide">Severity filter</Label>
+            <p className="text-[11px] text-muted-foreground mb-1">
+              Receive only events at or above a chosen severity.
+            </p>
+            <select
+              id="severity"
+              className="h-9 px-2 rounded-md border bg-background text-sm"
+              value={cfg.severityFilter ?? 'ALL'}
+              onChange={(e) => updateProfile.mutate(
+                { notificationConfig: { ...cfg, severityFilter: e.target.value as 'ALL' | 'WARN_AND_ABOVE' | 'CRITICAL_ONLY' } },
+                { onSuccess: () => toast.success('Filter updated'), onError: (er) => toast.error(er.message) },
+              )}>
+              <option value="ALL">All events</option>
+              <option value="WARN_AND_ABOVE">Warnings and critical only</option>
+              <option value="CRITICAL_ONLY">Critical only (errors, payment failures)</option>
+            </select>
+          </div>
+
+          <p className="text-[10px] text-muted-foreground italic border-t pt-2">
+            Note: Digest, quiet hours, and severity gates are stored in your profile; engine-side enforcement is rolling out — verify with a test message after changes.
+          </p>
+        </CardContent>
+      </Card>
+
       {/* ─── Channel preferences grid ─── */}
       <Card>
         <CardHeader>
           <CardTitle className="text-base">Per-event channels</CardTitle>
           <CardDescription>
-            Choose which channels receive each event type. Email and Discord coming soon.
+            Choose which channels receive each event type. Connect Telegram / Email / Discord / Push above first.
           </CardDescription>
         </CardHeader>
         <CardContent className="overflow-x-auto">
@@ -746,24 +878,19 @@ export default function NotificationPreferencesPage() {
                   </td>
                   {CHANNELS.map((c) => {
                     const enabled = isEnabled(c.key, e.key);
-                    const isComingSoon = c.key === 'EMAIL' || c.key === 'DISCORD';
                     return (
                       <td key={c.key} className="text-center px-2">
-                        {isComingSoon ? (
-                          <Badge variant="outline" className="text-[9px]">Soon</Badge>
-                        ) : (
-                          <button
-                            disabled={setPref.isPending}
-                            onClick={() => toggle(c.key, e.key, enabled)}
-                            className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
-                              enabled ? 'bg-primary' : 'bg-muted'
-                            }`}
-                          >
-                            <span className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${
-                              enabled ? 'translate-x-5' : 'translate-x-1'
-                            }`} />
-                          </button>
-                        )}
+                        <button
+                          disabled={setPref.isPending}
+                          onClick={() => toggle(c.key, e.key, enabled)}
+                          className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                            enabled ? 'bg-primary' : 'bg-muted'
+                          }`}
+                        >
+                          <span className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${
+                            enabled ? 'translate-x-5' : 'translate-x-1'
+                          }`} />
+                        </button>
                       </td>
                     );
                   })}

@@ -13,6 +13,25 @@ export interface NotificationConfig {
   // Periodic status reports
   statusReportIntervalMinutes?: number;
   statusReportBots?: 'ALL' | string[];
+  // Mute specific bots from all notifications
+  mutedBotIds?: string[];
+  // Batch notifications (0 = off / send immediately)
+  digestIntervalMinutes?: number;
+  // Quiet hours: notifications queue between these times (IANA tz, HH:MM)
+  quietHours?: { start: string; end: string; tz?: string } | null;
+  // Severity gate
+  severityFilter?: 'ALL' | 'WARN_AND_ABOVE' | 'CRITICAL_ONLY';
+  // UI preferences (kept inside notif config to avoid a schema migration)
+  preferences?: UserPreferences;
+}
+
+export interface UserPreferences {
+  locale?: 'en' | 'ar';
+  timezone?: string;
+  theme?: 'light' | 'dark' | 'system';
+  density?: 'compact' | 'comfortable';
+  defaultQuote?: string;
+  dateFormat?: 'DMY' | 'MDY' | 'YMD';
 }
 
 export interface User {
@@ -26,6 +45,8 @@ export interface User {
   lastStatusReportAt?: string | null;
   trialEndsAt?: string | null;
   referralCode?: string | null; createdAt: string; lastLoginAt?: string | null;
+  /** Active platform-wide announcement banner. */
+  announcement?: { message: string; severity: 'info' | 'warning' | 'critical' } | null;
 }
 
 export const useMe = () =>
@@ -42,11 +63,12 @@ export const useUpdateProfile = () => {
   return useMutation({
     mutationFn: (input: {
       fullName?: string;
+      avatarUrl?: string;
       telegramChatId?: string | null;
       telegramUsername?: string | null;
       discordWebhookUrl?: string | null;
       fillFrequency?: FillFrequency;
-      notificationConfig?: NotificationConfig;
+      notificationConfig?: NotificationConfig | Record<string, unknown>;
     }) => apiCall<User>(() => api.patch('/users/me', input)),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['me'] }),
   });
@@ -71,6 +93,103 @@ export const useTestDiscord = () =>
 export const useTestPush = () =>
   useMutation({
     mutationFn: () => apiCall<{ sent: number; failed: number }>(() => api.post('/users/me/push/test', {})),
+  });
+
+// ─── Sessions ───
+export interface UserSession {
+  id: string;
+  userAgent: string | null;
+  ipAddress: string | null;
+  expiresAt: string;
+  createdAt: string;
+}
+export const useSessions = () =>
+  useQuery({
+    queryKey: ['sessions'],
+    queryFn: () => apiCall<UserSession[]>(() => api.get('/users/me/sessions')),
+    enabled: !!tokenStore.access,
+  });
+
+export const useRevokeSession = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => apiCall<{ ok: true }>(() => api.delete(`/users/me/sessions/${id}`)),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['sessions'] }),
+  });
+};
+export const useRevokeAllSessions = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => apiCall<{ revoked: number }>(() => api.post('/users/me/sessions/revoke-all', {})),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['sessions'] }),
+  });
+};
+
+// ─── Audit log ───
+export interface AuditEntry {
+  id: string;
+  action: string;
+  actorType: string;
+  targetType: string | null;
+  targetId: string | null;
+  ipAddress: string | null;
+  userAgent: string | null;
+  metadata: Record<string, unknown> | null;
+  createdAt: string;
+}
+export const useAuditLog = () =>
+  useQuery({
+    queryKey: ['audit-log'],
+    queryFn: () => apiCall<AuditEntry[]>(() => api.get('/users/me/audit')),
+    enabled: !!tokenStore.access,
+  });
+
+// ─── Referrals ───
+export interface ReferralStats {
+  code: string | null;
+  count: number;
+  recent: Array<{ id: string; email: string; createdAt: string }>;
+}
+export const useReferralStats = () =>
+  useQuery({
+    queryKey: ['referrals'],
+    queryFn: () => apiCall<ReferralStats>(() => api.get('/users/me/referrals')),
+    enabled: !!tokenStore.access,
+  });
+
+// ─── Password + 2FA ───
+export const useChangePassword = () =>
+  useMutation({
+    mutationFn: (input: { currentPassword: string; newPassword: string }) =>
+      apiCall<{ success: true }>(() => api.post('/users/me/password', input)),
+  });
+
+export const useSetup2FA = () =>
+  useMutation({
+    mutationFn: () => apiCall<{ secret: string; otpauthUrl: string }>(() => api.post('/users/me/2fa/setup', {})),
+  });
+
+export const useVerify2FA = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (code: string) => apiCall<{ success: true }>(() => api.post('/users/me/2fa/verify', { code })),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['me'] }),
+  });
+};
+
+export const useDisable2FA = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (code: string) => apiCall<{ success: true }>(() => api.post('/users/me/2fa/disable', { code })),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['me'] }),
+  });
+};
+
+// ─── Account deletion ───
+export const useDeleteAccount = () =>
+  useMutation({
+    mutationFn: (confirmEmail: string) =>
+      apiCall<{ deleted: true }>(() => api.delete('/users/me', { data: { confirmEmail } })),
   });
 
 export const useSubscribePush = () => {
@@ -210,19 +329,30 @@ export interface Bot {
   baseAsset: string; quoteAsset: string;
   paperTrading?: boolean;
   totalTrades: number; realizedPnlQuote: string;
-  startedAt: string | null; createdAt: string;
+  startedAt: string | null; stoppedAt: string | null; createdAt: string;
+  archivedAt?: string | null;
+  currentRunId?: string | null;
+  totalRuns?: number;
   params?: Record<string, unknown>;
   strategy?: { id: string; name: string; type: string; builtinKey?: string | null };
   apiKey?: { id: string; label: string; status: string };
   /** Server-derived live stats (only present on list/detail responses). */
   liveStats?: BotLiveStats;
+  /** Lifetime aggregates across all runs of this bot. */
+  lifetimeStats?: {
+    totalRuns: number;
+    realized: number;
+    cycles: number;
+    volume: number;
+    fees: number;
+  };
   marketPrice?: string | null;
 }
 
-export const useBots = () =>
+export const useBots = (includeArchived = false) =>
   useQuery({
-    queryKey: ['bots'],
-    queryFn: () => apiCall<Bot[]>(() => api.get('/bots')),
+    queryKey: ['bots', { includeArchived }],
+    queryFn: () => apiCall<Bot[]>(() => api.get(`/bots${includeArchived ? '?archived=true' : ''}`)),
     enabled: !!tokenStore.access,
     refetchInterval: 30_000,
   });
@@ -261,6 +391,16 @@ export interface BotLive {
   strategyKey: string | null;
   initialStartPrice: string | null;
   marketPrice: string | null;
+  /** Active run id (null when bot is stopped). */
+  currentRunId: string | null;
+  /** Lifetime aggregates across all runs of this bot. */
+  lifetime: {
+    totalRuns: number;
+    realized: number;
+    cycles: number;
+    volume: number;
+    fees: number;
+  };
   orders: Array<{
     side: 'BUY' | 'SELL'; price: string; quantity: string; status: string;
     orderId: number | null; clientOrderId: string | null;
@@ -274,29 +414,54 @@ export interface BotLive {
     latestEvent: { type: string; message: string; createdAt: string } | null;
   };
   pnl: {
-    /** Realized P&L (FDUSD): Σ (sell_price − buy_price) × qty over closed cycles. */
     realized: number;
-    /** Unrealized (floating) P&L: (currentPrice − initialStartPrice) × heldQty. */
+    /** Unrealized = (currentPrice − avgCost) × signedHeld. */
     unrealized: number;
-    /** Total = realized + unrealized. */
     total: number;
     cyclesCompleted: number;
     avgPerCycle: number;
     series: Array<{ ts: number; pnl: number }>;
-    /** Held base inventory from BUY-side opens (positive). */
     heldQty: number;
-    /** Sold base inventory from SELL-side opens. */
     soldQty: number;
-    /** Net signed exposure used for unrealized math (+held −sold). */
     signedHeld: number;
-    /** DCA-only break-even price (= weighted avg cost). null if no position / Grid. */
+    /** Weighted-avg cost of open inventory. Available for Grid + DCA. */
     breakEvenPrice: number | null;
+    /** Capital actually deployed (Σ buy notional of open legs). */
+    actualInvested: number;
+    /** True ROI = (realized + unrealized) / actualInvested × 100. */
+    roi: number | null;
+    wins: number;
+    losses: number;
+    winRate: number | null;
+    avgWin: number;
+    avgLoss: number;
+    /** grossWins / grossLosses; null when no losses (or no trades). */
+    profitFactor: number | null;
+    bestCycle: number;
+    worstCycle: number;
+    maxDrawdownAbs: number;
+    maxDrawdownPct: number;
+    /** Sharpe ratio annualized (cycle-frequency). null if < 2 cycles. */
+    sharpe: number | null;
+    /** Open legs that contribute to the current avg cost. */
+    openLegs: Array<{ side: 'BUY' | 'SELL'; price: number; qty: number; notional: number }>;
   };
   volume: {
-    /** Total notional traded in quote (FDUSD). Σ trade.quoteQuantity. */
     totalQuote: number;
     tradeCount: number;
+    totalFees: number;
+    feeAsset: string | null;
   };
+  events: {
+    recent: Array<{
+      id: string;
+      type: string;
+      message: string;
+      createdAt: string;
+      cyclePnl: number | null;
+    }>;
+  };
+  heartbeat: { lastEventAtMs: number | null; stale: boolean };
   /** Active cooldown info (DCA Simple only — null otherwise). */
   cooldown: { untilMs: number; secondsRemaining: number } | null;
   /** Bot configuration as parsed from the params (mirrored for convenience). */
@@ -323,7 +488,18 @@ export interface BotLive {
     estimatedProfitAllFill: number | null;
     openBuyCount: number;
     openSellCount: number;
+    nextBuy: { price: number; distance: number; distancePct: number } | null;
+    nextSell: { price: number; distance: number; distancePct: number } | null;
   };
+  /** 24h ticker stats from Binance (null if exchange call failed). */
+  market: {
+    change24h: number;
+    changePct24h: number;
+    high24h: number;
+    low24h: number;
+    volume24h: number;
+    quoteVolume24h: number;
+  } | null;
 }
 
 export const useBotLive = (id: string) =>
@@ -333,6 +509,73 @@ export const useBotLive = (id: string) =>
     enabled: !!tokenStore.access && !!id,
     refetchInterval: 5_000,
   });
+
+// ─── Bot Runs ───
+export interface BotRunRow {
+  id: string;
+  runNumber: number;
+  status: 'RUNNING' | 'STOPPED' | 'ERROR';
+  startedAt: string;
+  stoppedAt: string | null;
+  stopReason: string | null;
+  realizedPnl: string;
+  unrealizedAtStop: string | null;
+  cyclesCompleted: number;
+  tradesCount: number;
+  volumeQuote: string;
+  fees: string;
+  maxDrawdownAbs: string | null;
+  durationMs: string | null;
+  initialStartPrice: string | null;
+  paramsSnapshot: Record<string, unknown>;
+}
+export const useBotRuns = (id: string) =>
+  useQuery({
+    queryKey: ['bot-runs', id],
+    queryFn: () => apiCall<BotRunRow[]>(() => api.get(`/bots/${id}/runs`)),
+    enabled: !!tokenStore.access && !!id,
+  });
+
+export const useReplayRun = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { botId: string; runId: string }) =>
+      apiCall(() => api.post(`/bots/${input.botId}/runs/${input.runId}/replay`, {})),
+    onSuccess: (_, input) => {
+      qc.invalidateQueries({ queryKey: ['bot', input.botId] });
+      qc.invalidateQueries({ queryKey: ['bot-runs', input.botId] });
+      qc.invalidateQueries({ queryKey: ['bots'] });
+    },
+  });
+};
+
+export const useUpdateBotParams = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { id: string; params: Record<string, unknown> }) =>
+      apiCall(() => api.patch(`/bots/${input.id}/params`, { params: input.params })),
+    onSuccess: (_, input) => {
+      qc.invalidateQueries({ queryKey: ['bot', input.id] });
+      qc.invalidateQueries({ queryKey: ['bot-live', input.id] });
+    },
+  });
+};
+
+export const useArchiveBot = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => apiCall(() => api.post(`/bots/${id}/archive`, {})),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['bots'] }),
+  });
+};
+
+export const useUnarchiveBot = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => apiCall(() => api.post(`/bots/${id}/unarchive`, {})),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['bots'] }),
+  });
+};
 
 export const useCreateBot = () => {
   const qc = useQueryClient();
@@ -367,6 +610,23 @@ export const useStopBot = () => {
       qc.invalidateQueries({ queryKey: ['bots'] });
       qc.invalidateQueries({ queryKey: ['bot', id] });
     },
+  });
+};
+
+export const useCloneBot = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { id: string; name?: string; symbol?: string }) =>
+      apiCall<Bot>(() => api.post(`/bots/${input.id}/clone`, { name: input.name, symbol: input.symbol })),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['bots'] }),
+  });
+};
+
+export const useCancelPending = () => {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => apiCall<{ ok: true }>(() => api.post(`/bots/${id}/cancel-pending`)),
+    onSuccess: (_, id) => qc.invalidateQueries({ queryKey: ['bot-live', id] }),
   });
 };
 

@@ -7,6 +7,8 @@ import { ENGINE_EVENT_CHANNEL, type EngineEvent } from '../bridge/channels';
 
 interface BuildContextArgs {
   botId: string;
+  /** Active run id — events and state version key derived from this. */
+  botRunId?: string;
   symbol: string;
   filters: SymbolFilters;
   client: BinanceClient;
@@ -15,7 +17,7 @@ interface BuildContextArgs {
 }
 
 export function buildStrategyContext(args: BuildContextArgs): StrategyContext {
-  const { botId, symbol, filters, client, logger, redis } = args;
+  const { botId, botRunId, symbol, filters, client, logger, redis } = args;
 
   return {
     botId,
@@ -104,6 +106,7 @@ export function buildStrategyContext(args: BuildContextArgs): StrategyContext {
       await prisma.botEvent.create({
         data: {
           botId,
+          ...(botRunId ? { botRunId } : {}),
           type,
           message,
           ...(data ? { data: data as object } : {}),

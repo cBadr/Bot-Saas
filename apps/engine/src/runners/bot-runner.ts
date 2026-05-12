@@ -45,6 +45,8 @@ export class BotRunner {
   private tickTimer?: NodeJS.Timeout;
   private stopped = false;
   private isPaper = false;
+  /** The BotRun row this runner is associated with. Created at start, closed at stop. */
+  private currentRunId?: string;
 
   constructor(
     public readonly botId: string,
@@ -115,10 +117,19 @@ export class BotRunner {
       this.filters = extractFilters(ex.symbols[0]!);
     }
 
+    // Create / resume the BotRun row.
+    //   - If Bot.currentRunId is set and RUNNING, reuse it (resume after crash).
+    //   - Otherwise, create a new run with paramsSnapshot frozen at this moment.
+    this.currentRunId = await this.ensureBotRun(bot.id, bot.params, bot.currentRunId);
+
     // Update DB → RUNNING
     await prisma.bot.update({
       where: { id: this.botId },
-      data: { status: 'RUNNING', startedAt: new Date(), lastError: null, workerId: process.pid.toString() },
+      data: {
+        status: 'RUNNING', startedAt: new Date(), lastError: null,
+        workerId: process.pid.toString(),
+        currentRunId: this.currentRunId,
+      },
     });
     await this.publishStatus('RUNNING', this.isPaper ? 'Paper bot started' : 'Bot started');
 
@@ -154,6 +165,7 @@ export class BotRunner {
     // Initialize the strategy (places initial orders)
     const ctx = buildStrategyContext({
       botId: this.botId,
+      botRunId: this.currentRunId,
       symbol: bot.symbol,
       filters: this.filters!,
       client: this.client as BinanceClient,
@@ -180,6 +192,7 @@ export class BotRunner {
       if (this.strategy && this.client && this.filters) {
         const ctx = buildStrategyContext({
           botId: this.botId,
+          botRunId: this.currentRunId,
           symbol: (await prisma.bot.findUnique({ where: { id: this.botId } }))!.symbol,
           filters: this.filters,
           client: this.client as BinanceClient,
@@ -195,9 +208,10 @@ export class BotRunner {
     try { await this.wsUserStream?.stop(); } catch {}
     try { this.orderPoller?.stop(); } catch {}
     try { this.paperClient?.stop(); } catch {}
+    await this.closeRun('STOPPED', reason);
     await prisma.bot.update({
       where: { id: this.botId },
-      data: { status: 'STOPPED', stoppedAt: new Date() },
+      data: { status: 'STOPPED', stoppedAt: new Date(), currentRunId: null },
     });
     await this.publishStatus('STOPPED', reason);
   }
@@ -209,6 +223,7 @@ export class BotRunner {
     try { await this.userStream?.stop(); } catch {}
     try { await this.wsUserStream?.stop(); } catch {}
     try { this.orderPoller?.stop(); } catch {}
+    await this.closeRun('ERROR', message);
     await prisma.bot.update({
       where: { id: this.botId },
       data: {
@@ -216,9 +231,109 @@ export class BotRunner {
         stoppedAt: new Date(),
         lastErrorAt: new Date(),
         lastError: message,
+        currentRunId: null,
       },
     });
     await this.publishStatus('ERROR', message);
+  }
+
+  /**
+   * Resume an existing RUNNING BotRun if present (engine restart case),
+   * otherwise create a new run #N with frozen paramsSnapshot.
+   */
+  private async ensureBotRun(botId: string, params: unknown, currentRunId: string | null): Promise<string> {
+    if (currentRunId) {
+      const existing = await prisma.botRun.findUnique({ where: { id: currentRunId } });
+      if (existing && existing.status === 'RUNNING') {
+        return existing.id;
+      }
+    }
+    // Determine next run number for this bot.
+    const last = await prisma.botRun.findFirst({
+      where: { botId },
+      orderBy: { runNumber: 'desc' },
+      select: { runNumber: true },
+    });
+    const runNumber = (last?.runNumber ?? 0) + 1;
+    const run = await prisma.botRun.create({
+      data: {
+        botId,
+        runNumber,
+        paramsSnapshot: params as object,
+        status: 'RUNNING',
+      },
+    });
+    this.logger.info('BotRun started', { runId: run.id, runNumber });
+    return run.id;
+  }
+
+  /**
+   * Close the active BotRun with final stats. Also bumps the parent Bot's
+   * lifetime aggregates. Idempotent — safe to call twice (no-op if already stopped).
+   */
+  private async closeRun(
+    finalStatus: 'STOPPED' | 'ERROR',
+    reason: string,
+  ): Promise<void> {
+    if (!this.currentRunId) return;
+    const runId = this.currentRunId;
+    try {
+      const run = await prisma.botRun.findUnique({ where: { id: runId } });
+      if (!run || run.status !== 'RUNNING') return;
+
+      // Snapshot stats for this run from trades + events scoped to it.
+      const [tradeAgg, eventCycles, botState] = await Promise.all([
+        prisma.trade.aggregate({
+          where: { botRunId: runId },
+          _sum: { quoteQuantity: true, commission: true },
+          _count: true,
+        }),
+        prisma.botEvent.count({
+          where: { botRunId: runId, type: { in: ['BUY_FILLED', 'SELL_FILLED', 'DCA_BUY_FILLED', 'DCA_SELL_FILLED'] }, data: { path: ['cycleClosed'], equals: true } as never },
+        }),
+        prisma.bot.findUnique({ where: { id: this.botId }, select: { realizedPnlQuote: true, state: true } }),
+      ]);
+
+      const stateObj = (botState?.state ?? null) as null | { realizedPnlQuote?: string; cyclesCompleted?: number; initialStartPrice?: string };
+      const stateRealized = stateObj?.realizedPnlQuote ? Number(stateObj.realizedPnlQuote) : Number(botState?.realizedPnlQuote ?? 0);
+      const cycles = stateObj?.cyclesCompleted ?? eventCycles;
+      const startPrice = stateObj?.initialStartPrice ? Number(stateObj.initialStartPrice) : null;
+      const fees = Number(tradeAgg._sum.commission ?? 0);
+      const volume = Number(tradeAgg._sum.quoteQuantity ?? 0);
+      const durationMs = BigInt(Date.now() - run.startedAt.getTime());
+
+      await prisma.$transaction([
+        prisma.botRun.update({
+          where: { id: runId },
+          data: {
+            status: finalStatus,
+            stoppedAt: new Date(),
+            stopReason: reason,
+            realizedPnl: stateRealized,
+            cyclesCompleted: cycles,
+            tradesCount: tradeAgg._count,
+            volumeQuote: volume,
+            fees,
+            durationMs,
+            ...(finalStatus === 'ERROR' ? { errorMessage: reason } : {}),
+            ...(startPrice !== null ? { initialStartPrice: startPrice } : {}),
+          },
+        }),
+        prisma.bot.update({
+          where: { id: this.botId },
+          data: {
+            totalRuns: { increment: 1 },
+            lifetimeRealized: { increment: stateRealized },
+            lifetimeCycles: { increment: cycles },
+            lifetimeVolume: { increment: volume },
+            lifetimeFees: { increment: fees },
+          },
+        }),
+      ]);
+      this.logger.info('BotRun closed', { runId, status: finalStatus, realized: stateRealized, cycles });
+    } catch (err) {
+      this.logger.error('closeRun failed', { err: err instanceof Error ? err.message : String(err) });
+    }
   }
 
   private async handleUserDataEvent(event: { e?: string; [k: string]: unknown }): Promise<void> {
@@ -279,6 +394,7 @@ export class BotRunner {
             where: { exchangeTradeId_symbol: { exchangeTradeId: String(tradeId), symbol } },
             create: {
               botId: this.botId,
+              ...(this.currentRunId ? { botRunId: this.currentRunId } : {}),
               orderId: orderRow.id,
               exchangeTradeId: String(tradeId),
               symbol,
@@ -306,6 +422,7 @@ export class BotRunner {
     if (!this.strategy || !this.client || !this.filters) return;
     const ctx = buildStrategyContext({
       botId: this.botId,
+      botRunId: this.currentRunId,
       symbol,
       filters: this.filters,
       client: this.client as BinanceClient,
@@ -343,6 +460,7 @@ export class BotRunner {
     // BotEvent + Redis Pub/Sub → NotificationDispatcher.
     const ctx = buildStrategyContext({
       botId: this.botId,
+      botRunId: this.currentRunId,
       symbol: bot.symbol,
       filters: this.filters,
       client: this.client as BinanceClient,

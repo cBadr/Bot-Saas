@@ -1,53 +1,91 @@
 'use client';
+import { useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
-import { useBot, useBotEvents, useBotLive, useBotOrders, useRecomputeBotStats, useStartBot, useStopBot } from '@/lib/queries';
+import { useBot, useBotLive, useBotOrders, useRecomputeBotStats, useStartBot, useStopBot } from '@/lib/queries';
 import { useBotRealtime } from '@/lib/realtime';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { StatusBadge } from '@/components/status-badge';
 import { LiveTradingChart } from '@/components/live-trading-chart';
-import { IntegrityWidget } from '@/components/integrity-widget';
-import { PnLSparkline } from '@/components/pnl-sparkline';
 import { BotConfigCard } from '@/components/bot-config-card';
-import { PositionStateCard } from '@/components/position-state-card';
 import { PerformanceCard } from '@/components/performance-card';
-import { formatDuration, formatNumber, formatRelativeTime } from '@/lib/utils';
-import { ArrowLeft, RefreshCw, TrendingUp, TrendingDown } from 'lucide-react';
+import { PositionBreakdownCard } from '@/components/position-breakdown-card';
+import { EventsTimeline } from '@/components/events-timeline';
+import { GridLevelsViz } from '@/components/grid-levels-viz';
+import { CyclePnLHistogram } from '@/components/cycle-pnl-histogram';
+import { QuickActionsBar } from '@/components/quick-actions-bar';
+import { WhatIfSimulator } from '@/components/what-if-simulator';
+import { EquityCurve } from '@/components/equity-curve';
+import { MarketPriceBanner } from '@/components/market-price-banner';
+import { OrdersHealthCard } from '@/components/orders-health';
+import { RunsHistory } from '@/components/runs-history';
+import { LifetimeStats } from '@/components/lifetime-stats';
+import { formatDuration, formatNumber } from '@/lib/utils';
+import {
+  ArrowLeft, RefreshCw, TrendingUp, TrendingDown,
+  LayoutDashboard, Wallet, BarChart3, ListChecks, Activity, Settings, History,
+} from 'lucide-react';
 import { toast } from 'sonner';
+
+type Tab = 'overview' | 'position' | 'performance' | 'orders' | 'activity' | 'history' | 'config';
+
+const TABS: { key: Tab; label: string; icon: React.ComponentType<{ className?: string }> }[] = [
+  { key: 'overview',    label: 'Overview',    icon: LayoutDashboard },
+  { key: 'position',    label: 'Position',    icon: Wallet },
+  { key: 'performance', label: 'Performance', icon: BarChart3 },
+  { key: 'orders',      label: 'Orders',      icon: ListChecks },
+  { key: 'activity',    label: 'Activity',    icon: Activity },
+  { key: 'history',     label: 'History',     icon: History },
+  { key: 'config',      label: 'Config',      icon: Settings },
+];
 
 export default function BotDetailPage() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
   useBotRealtime(id);
   const { data: bot } = useBot(id);
-  const { data: events } = useBotEvents(id);
   const { data: orders } = useBotOrders(id);
   const { data: live } = useBotLive(id);
   const start = useStartBot();
   const stop = useStopBot();
   const recompute = useRecomputeBotStats();
+  const [tab, setTab] = useState<Tab>('overview');
 
   if (!bot) return <div className="text-muted-foreground">Loading bot…</div>;
+  const baseAsset = deriveBaseAsset(bot.symbol, bot.quoteAsset);
+
+  // Archive nudge: bot stopped > 30 days, has run history, and not yet archived.
+  const idleDaysMs = bot.stoppedAt ? Date.now() - new Date(bot.stoppedAt).getTime() : 0;
+  const showArchiveNudge = !bot.archivedAt
+    && bot.status === 'STOPPED'
+    && (live?.lifetime.totalRuns ?? 0) > 0
+    && idleDaysMs > 30 * 86_400_000;
 
   return (
-    <div className="space-y-6 max-w-7xl">
-      {/* ─── Header ─── */}
-      <div className="flex items-center gap-4">
-        <Button variant="ghost" size="icon" onClick={() => router.back()}><ArrowLeft className="h-4 w-4" /></Button>
+    <div className="space-y-5 max-w-7xl">
+      {/* ─── Slim header ─── */}
+      <div className="flex items-start gap-3">
+        <Button variant="ghost" size="icon" onClick={() => router.back()}>
+          <ArrowLeft className="h-4 w-4" />
+        </Button>
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-3 flex-wrap">
-            <h1 className="text-3xl font-bold truncate">{bot.name}</h1>
+          <div className="flex items-center gap-2 flex-wrap">
+            <h1 className="text-2xl font-bold truncate">{bot.name}</h1>
             <StatusBadge status={bot.status} />
             {bot.paperTrading && (
               <Badge variant="outline" className="text-[10px] border-yellow-500/50 text-yellow-700 dark:text-yellow-400">
                 paper
               </Badge>
             )}
+            {live?.heartbeat && (
+              <span className="flex items-center gap-1 text-[10px] text-muted-foreground ml-auto">
+                <span className={`h-2 w-2 rounded-full ${live.heartbeat.stale ? 'bg-destructive' : 'bg-success animate-pulse'}`} />
+                {live.heartbeat.stale ? 'engine idle' : 'engine live'}
+              </span>
+            )}
           </div>
-          <div className="flex items-center gap-2 text-sm text-muted-foreground flex-wrap mt-1">
-            <Badge variant="outline" className="font-mono text-[10px]">{bot.symbol}</Badge>
-            <span>·</span>
+          <div className="flex items-center gap-2 text-xs text-muted-foreground flex-wrap mt-1">
             <span>{bot.strategy?.name ?? '—'}</span>
             {live?.config.direction && (
               <>
@@ -63,138 +101,155 @@ export default function BotDetailPage() {
             {bot.startedAt && (
               <>
                 <span>·</span>
-                <span className="font-mono text-xs">running {formatDuration(bot.startedAt)}</span>
+                <span className="font-mono">running {formatDuration(bot.startedAt)}</span>
               </>
             )}
           </div>
         </div>
-        <div className="flex gap-2">
+        <div className="flex gap-1.5">
           <Button variant="ghost" size="icon" disabled={recompute.isPending}
             onClick={() => recompute.mutate(bot.id, { onSuccess: () => toast.success('Stats refreshed'), onError: (e) => toast.error(e.message) })}
             title="Recompute stats from trade history">
             <RefreshCw className={`h-4 w-4 ${recompute.isPending ? 'animate-spin' : ''}`} />
           </Button>
           {bot.status === 'RUNNING' || bot.status === 'STARTING' ? (
-            <Button variant="outline" onClick={() => stop.mutate(bot.id, { onSuccess: () => toast.success('Stopping') })}>Stop</Button>
+            <Button variant="outline" size="sm" onClick={() => stop.mutate(bot.id, { onSuccess: () => toast.success('Stopping') })}>Stop</Button>
           ) : (
-            <Button variant="success" onClick={() => start.mutate(bot.id, { onSuccess: () => toast.success('Starting'), onError: (e) => toast.error(e.message) })}>Start</Button>
+            <Button variant="success" size="sm" onClick={() => start.mutate(bot.id, { onSuccess: () => toast.success('Starting'), onError: (e) => toast.error(e.message) })}>Start</Button>
           )}
         </div>
       </div>
 
-      {/* ─── 4 KPI Tiles: Total / Realized / Floating / Volume ─── */}
-      <div className="grid gap-4 md:grid-cols-4">
-        <KpiTile
-          icon={live && live.pnl.total >= 0 ? <TrendingUp className="h-4 w-4" /> : <TrendingDown className="h-4 w-4" />}
-          label="Total Profits"
-          value={live ? signed(live.pnl.total) : '—'}
-          sub={bot.quoteAsset}
-          tone={kpiTone(live?.pnl.total)}
-          big
-        />
-        <KpiTile
-          icon={<TrendingUp className="h-4 w-4" />}
-          label="Realized P&L"
-          value={live ? signed(live.pnl.realized) : '—'}
-          sub={live ? `${live.pnl.cyclesCompleted} cycle${live.pnl.cyclesCompleted === 1 ? '' : 's'}` : bot.quoteAsset}
-          tone={kpiTone(live?.pnl.realized)}
-        />
-        <KpiTile
-          icon={live && live.pnl.unrealized >= 0
-            ? <TrendingUp className="h-4 w-4" />
-            : <TrendingDown className="h-4 w-4" />}
-          label="Floating P&L"
-          value={live && live.pnl.unrealized !== 0 ? signed(live.pnl.unrealized) : '—'}
-          sub={bot.quoteAsset}
-          tone={kpiTone(live?.pnl.unrealized)}
-        />
-        <KpiTile
-          icon={<RefreshCw className="h-4 w-4" />}
-          label="Total Volume"
-          value={live ? formatNumber(live.volume.totalQuote, { maximumFractionDigits: 2 }) : '—'}
-          sub={live && live.volume.tradeCount > 0
-            ? `${live.volume.tradeCount} trade${live.volume.tradeCount === 1 ? '' : 's'}`
-            : bot.quoteAsset}
-        />
+      {/* Archive nudge for long-idle bots */}
+      {showArchiveNudge && (
+        <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 flex items-center gap-2 text-xs">
+          <span>This bot has been idle for over {Math.floor(idleDaysMs / 86_400_000)} days. Consider archiving to keep your active list clean — data is preserved.</span>
+        </div>
+      )}
+
+      {/* ─── Market price banner (the page anchor) ─── */}
+      {live && <MarketPriceBanner live={live} baseAsset={baseAsset} quoteAsset={bot.quoteAsset} />}
+
+      {/* ─── Compact KPI strip (no duplication with banner) ─── */}
+      {live && (
+        <div className="grid gap-3 md:grid-cols-4">
+          <Kpi label="Total P&L" value={signed(live.pnl.total)} sub={bot.quoteAsset} tone={kpiTone(live.pnl.total)} big />
+          <Kpi label="Realized"
+               value={signed(live.pnl.realized)}
+               sub={`${live.pnl.cyclesCompleted} cycle${live.pnl.cyclesCompleted === 1 ? '' : 's'}`}
+               tone={kpiTone(live.pnl.realized)} />
+          <Kpi label="Floating"
+               value={live.pnl.unrealized !== 0 ? signed(live.pnl.unrealized) : '—'}
+               sub={bot.quoteAsset}
+               tone={kpiTone(live.pnl.unrealized)} />
+          <Kpi label="ROI"
+               value={live.pnl.roi !== null ? `${live.pnl.roi >= 0 ? '+' : ''}${live.pnl.roi.toFixed(2)}%` : '—'}
+               sub={`vol ${formatNumber(live.volume.totalQuote, { maximumFractionDigits: 0 })}`}
+               tone={live.pnl.roi !== null ? (live.pnl.roi >= 0 ? 'positive' : 'negative') : undefined} />
+        </div>
+      )}
+
+      {/* ─── Tabs ─── */}
+      <div className="flex items-center gap-1 border-b overflow-x-auto">
+        {TABS.map((t) => {
+          const Icon = t.icon;
+          const active = tab === t.key;
+          return (
+            <button
+              key={t.key}
+              onClick={() => setTab(t.key)}
+              className={`flex items-center gap-1.5 px-3 py-2 text-sm border-b-2 transition-colors whitespace-nowrap ${
+                active
+                  ? 'border-primary text-primary font-medium'
+                  : 'border-transparent text-muted-foreground hover:text-foreground'
+              }`}>
+              <Icon className="h-3.5 w-3.5" />
+              {t.label}
+            </button>
+          );
+        })}
+        <div className="ml-auto">
+          <QuickActionsBar botId={bot.id} botName={bot.name} />
+        </div>
       </div>
 
-      {/* ─── Live monitoring (Grid Simple + DCA Simple) ─── */}
-      {live && (live.initialStartPrice || live.integrity.total > 0 || live.pnl.cyclesCompleted > 0 || live.cooldown) && (
+      {/* ─── Tab content ─── */}
+      {live && (
         <>
-          {/* Live trading chart — full width */}
-          <LiveTradingChart live={live} />
+          {tab === 'overview' && (
+            <div className="space-y-5">
+              <LiveTradingChart live={live} />
+              <LifetimeStats live={live} quoteAsset={bot.quoteAsset} />
+              <div className="grid gap-5 lg:grid-cols-2">
+                <OrdersHealthCard live={live} />
+                <EquityCurve live={live} />
+              </div>
+            </div>
+          )}
 
-          {/* 3-card row: Configuration / Position State / Performance */}
-          <div className="grid gap-6 lg:grid-cols-3">
+          {tab === 'position' && (
+            <div className="space-y-5">
+              <PositionBreakdownCard live={live} baseAsset={baseAsset} quoteAsset={bot.quoteAsset} />
+              <WhatIfSimulator live={live} quoteAsset={bot.quoteAsset} />
+            </div>
+          )}
+
+          {tab === 'performance' && (
+            <div className="space-y-5">
+              <div className="grid gap-5 lg:grid-cols-2">
+                <PerformanceCard live={live} quoteAsset={bot.quoteAsset} />
+                <EquityCurve live={live} />
+              </div>
+              <CyclePnLHistogram live={live} />
+            </div>
+          )}
+
+          {tab === 'orders' && (
+            <div className="space-y-5">
+              <OrdersHealthCard live={live} />
+              <GridLevelsViz live={live} />
+              <Card>
+                <CardHeader><CardTitle className="text-base">Recent orders (history)</CardTitle></CardHeader>
+                <CardContent className="max-h-[400px] overflow-y-auto">
+                  {!orders?.length ? (
+                    <p className="text-sm text-muted-foreground italic">No orders yet.</p>
+                  ) : (
+                    <div className="space-y-1">
+                      {orders.map((o) => (
+                        <div key={o.id} className="flex items-center justify-between text-xs border-b last:border-0 py-1.5">
+                          <div className="flex items-center gap-2">
+                            <Badge variant={o.side === 'BUY' ? 'success' : 'destructive'} className="text-[9px]">{o.side}</Badge>
+                            <span className="font-mono">{formatNumber(o.quantity)} @ {formatNumber(o.price)}</span>
+                          </div>
+                          <div className="flex items-center gap-2 text-muted-foreground">
+                            <Badge variant="outline" className="text-[9px]">{o.status}</Badge>
+                            <span className="text-[10px]">{new Date(o.placedAt).toLocaleString()}</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            </div>
+          )}
+
+          {tab === 'activity' && <EventsTimeline live={live} />}
+
+          {tab === 'history' && (
+            <RunsHistory botId={bot.id} botStatus={bot.status} />
+          )}
+
+          {tab === 'config' && (
             <BotConfigCard
               builtinKey={bot.strategy?.builtinKey ?? null}
               params={bot.params}
               paperTrading={bot.paperTrading}
               quoteAsset={bot.quoteAsset}
             />
-            <PositionStateCard
-              live={live}
-              baseAsset={deriveBaseAsset(live.symbol, bot.quoteAsset)}
-            />
-            <PerformanceCard
-              live={live}
-              quoteAsset={bot.quoteAsset}
-            />
-          </div>
-
-          {/* 2-card row: Integrity / PnL chart */}
-          <div className="grid gap-6 md:grid-cols-2">
-            <IntegrityWidget live={live} />
-            <PnLSparkline live={live} />
-          </div>
+          )}
         </>
       )}
-
-      <div className="grid gap-6 lg:grid-cols-2">
-        <Card>
-          <CardHeader><CardTitle>Recent Events</CardTitle></CardHeader>
-          <CardContent className="max-h-[500px] overflow-y-auto">
-            {!events?.length ? (
-              <p className="text-sm text-muted-foreground">No events yet.</p>
-            ) : (
-              <div className="space-y-2">
-                {events.map((e) => (
-                  <div key={e.id} className="text-sm border-l-2 border-primary/40 pl-3 py-1">
-                    <div className="flex items-center gap-2">
-                      <Badge variant="outline" className="text-[10px]">{e.type}</Badge>
-                      <span className="text-xs text-muted-foreground">{formatRelativeTime(e.createdAt)}</span>
-                    </div>
-                    <p className="mt-0.5">{e.message}</p>
-                  </div>
-                ))}
-              </div>
-            )}
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader><CardTitle>Recent Orders</CardTitle></CardHeader>
-          <CardContent className="max-h-[500px] overflow-y-auto">
-            {!orders?.length ? (
-              <p className="text-sm text-muted-foreground">No orders yet.</p>
-            ) : (
-              <div className="space-y-2">
-                {orders.map((o) => (
-                  <div key={o.id} className="flex items-center justify-between text-sm border-b py-2">
-                    <div className="flex items-center gap-2">
-                      <Badge variant={o.side === 'BUY' ? 'success' : 'destructive'} className="text-[10px]">{o.side}</Badge>
-                      <span className="font-mono">{formatNumber(o.quantity)} @ {formatNumber(o.price)}</span>
-                    </div>
-                    <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                      <Badge variant="outline" className="text-[10px]">{o.status}</Badge>
-                      <span>{formatRelativeTime(o.placedAt)}</span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      </div>
     </div>
   );
 }
@@ -218,29 +273,20 @@ function kpiTone(n: number | undefined): 'positive' | 'negative' | undefined {
   return n > 0 ? 'positive' : 'negative';
 }
 
-function KpiTile({
-  icon, label, value, sub, tone, big,
-}: {
-  icon?: React.ReactNode;
-  label: string;
-  value: string;
-  sub?: string;
-  tone?: 'positive' | 'negative';
-  big?: boolean;
+function Kpi({ label, value, sub, tone, big }: {
+  label: string; value: string; sub?: string; tone?: 'positive' | 'negative'; big?: boolean;
 }) {
   const toneClass = tone === 'positive' ? 'text-success'
     : tone === 'negative' ? 'text-destructive'
     : '';
   return (
-    <Card className={big ? 'border-2 border-primary/20' : undefined}>
-      <CardContent className="p-5">
-        <div className="flex items-center gap-1.5 text-xs uppercase tracking-wide text-muted-foreground mb-1.5">
-          {icon}<span>{label}</span>
-        </div>
-        <div className={`font-bold tabular-nums ${toneClass} ${big ? 'text-3xl' : 'text-2xl'}`}>
+    <Card className={big ? 'border-primary/40' : undefined}>
+      <CardContent className="p-4">
+        <div className="text-[10px] uppercase tracking-wide text-muted-foreground mb-1">{label}</div>
+        <div className={`font-bold tabular-nums ${toneClass} ${big ? 'text-2xl' : 'text-xl'}`}>
           {value}
         </div>
-        {sub && <div className="text-[11px] text-muted-foreground mt-1">{sub}</div>}
+        {sub && <div className="text-[10px] text-muted-foreground mt-0.5 truncate">{sub}</div>}
       </CardContent>
     </Card>
   );

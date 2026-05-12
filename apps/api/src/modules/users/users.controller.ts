@@ -1,15 +1,41 @@
-import { Body, Controller, Get, Patch, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, UseGuards } from '@nestjs/common';
 import { z } from 'zod';
 import { JwtAuthGuard } from '../auth/guards';
 import { CurrentUser, type CurrentUserPayload } from '../../common/decorators/current-user.decorator';
 import { ZodValidationPipe } from '../../common/pipes/zod.pipe';
 import { UsersService } from './users.service';
 
+const QuietHoursDto = z.object({
+  start: z.string().regex(/^\d{2}:\d{2}$/, 'HH:MM'),
+  end: z.string().regex(/^\d{2}:\d{2}$/, 'HH:MM'),
+  tz: z.string().min(1).max(64).optional(),  // IANA tz string; default UTC if missing
+}).strict();
+
+const UserPreferencesDto = z.object({
+  locale: z.enum(['en', 'ar']).optional(),
+  timezone: z.string().min(1).max(64).optional(),
+  theme: z.enum(['light', 'dark', 'system']).optional(),
+  density: z.enum(['compact', 'comfortable']).optional(),
+  defaultQuote: z.string().min(2).max(10).optional(),
+  dateFormat: z.enum(['DMY', 'MDY', 'YMD']).optional(),
+}).strict();
+
 const NotificationConfigDto = z.object({
+  // Existing fill filters
   notifyOnBuyFills: z.boolean().optional(),
   notifyOnSellFills: z.boolean().optional(),
   minFillNotional: z.coerce.number().min(0).optional(),
   minCyclePnl: z.coerce.number().min(0).optional(),
+  // Status reports
+  statusReportIntervalMinutes: z.coerce.number().int().min(0).optional(),
+  statusReportBots: z.union([z.literal('ALL'), z.array(z.string())]).optional(),
+  // New: per-bot mute, digest, quiet hours, severity
+  mutedBotIds: z.array(z.string()).optional(),
+  digestIntervalMinutes: z.coerce.number().int().min(0).max(1440).optional(),
+  quietHours: QuietHoursDto.nullable().optional(),
+  severityFilter: z.enum(['ALL', 'WARN_AND_ABOVE', 'CRITICAL_ONLY']).optional(),
+  // UI preferences live alongside notif config to avoid a schema migration.
+  preferences: UserPreferencesDto.optional(),
 }).strict();
 
 const UpdateProfileDto = z.object({
@@ -119,11 +145,67 @@ export class UsersController {
     return this.users.addPushSubscription(u.sub, dto);
   }
 
+  @Post('me/survey')
+  submitSurvey(
+    @CurrentUser() u: CurrentUserPayload,
+    @Body(new ZodValidationPipe(z.object({
+      surveyKey: z.string().min(2).max(40).optional(),
+      score: z.coerce.number().int().min(0).max(10).optional(),
+      comment: z.string().max(1000).optional(),
+      metadata: z.record(z.unknown()).optional(),
+    }))) dto: { surveyKey?: string; score?: number; comment?: string; metadata?: Record<string, unknown> },
+  ) {
+    return this.users.submitSurvey(u.sub, dto);
+  }
+
   @Post('me/push/unsubscribe')
   unsubscribePush(
     @CurrentUser() u: CurrentUserPayload,
     @Body(new ZodValidationPipe(z.object({ endpoint: z.string().url() }))) dto: { endpoint: string },
   ) {
     return this.users.removePushSubscription(u.sub, dto.endpoint);
+  }
+
+  // ─── Active sessions ───
+  @Get('me/sessions')
+  listSessions(@CurrentUser() u: CurrentUserPayload) {
+    return this.users.listSessions(u.sub);
+  }
+
+  @Delete('me/sessions/:id')
+  revokeSession(@CurrentUser() u: CurrentUserPayload, @Param('id') id: string) {
+    return this.users.revokeSession(u.sub, id);
+  }
+
+  @Post('me/sessions/revoke-all')
+  revokeAllSessions(@CurrentUser() u: CurrentUserPayload) {
+    return this.users.revokeAllSessions(u.sub);
+  }
+
+  // ─── Audit log ───
+  @Get('me/audit')
+  audit(@CurrentUser() u: CurrentUserPayload) {
+    return this.users.auditLog(u.sub);
+  }
+
+  // ─── Referrals ───
+  @Get('me/referrals')
+  referrals(@CurrentUser() u: CurrentUserPayload) {
+    return this.users.referralStats(u.sub);
+  }
+
+  // ─── GDPR data export ───
+  @Get('me/export')
+  exportData(@CurrentUser() u: CurrentUserPayload) {
+    return this.users.exportData(u.sub);
+  }
+
+  // ─── Account deletion (soft) ───
+  @Delete('me')
+  deleteAccount(
+    @CurrentUser() u: CurrentUserPayload,
+    @Body(new ZodValidationPipe(z.object({ confirmEmail: z.string().email() }))) dto: { confirmEmail: string },
+  ) {
+    return this.users.deleteAccount(u.sub, dto.confirmEmail);
   }
 }

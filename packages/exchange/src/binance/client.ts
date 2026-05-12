@@ -179,6 +179,44 @@ export class BinanceClient {
     return this.signedGet(BINANCE_ENDPOINTS.MY_TRADES, params);
   }
 
+  // ─── Capital movements (deposits / withdrawals) ────────
+  /** Recent deposits — Binance default window is 90 days. */
+  async getDepositHistory(params: {
+    coin?: string; startTime?: number; endTime?: number; limit?: number;
+  } = {}): Promise<Array<{
+    amount: string; coin: string; network: string; status: number;
+    address: string; addressTag: string; txId: string; insertTime: number;
+    transferType: number; confirmTimes: string; unlockConfirm: number; walletType: number;
+  }>> {
+    return this.signedGet('/sapi/v1/capital/deposit/hisrec', params);
+  }
+
+  /** Recent withdrawals — Binance default window is 90 days. */
+  async getWithdrawHistory(params: {
+    coin?: string; status?: number; startTime?: number; endTime?: number; limit?: number;
+  } = {}): Promise<Array<{
+    id: string; amount: string; transactionFee: string; coin: string;
+    status: number; address: string; addressTag: string; txId: string;
+    applyTime: string; network: string; transferType: number; info: string;
+  }>> {
+    return this.signedGet('/sapi/v1/capital/withdraw/history', params);
+  }
+
+  /** Convert dust balances to BNB. Pass asset symbols (max 100). */
+  async convertDust(assets: string[]): Promise<{
+    totalServiceCharge: string; totalTransfered: string;
+    transferResult: Array<{
+      amount: string; fromAsset: string;
+      operateTime: number; serviceChargeAmount: string;
+      tranId: number; transferedAmount: string;
+    }>;
+  }> {
+    // Binance dust endpoint accepts repeated `asset` params; we encode them
+    // manually and append after the signed query to keep the signature valid
+    // (Binance signs `query` so we sign asset=... entries explicitly).
+    return this.signedPost('/sapi/v1/asset/dust', { asset: assets.join(',') }, false);
+  }
+
   // ─── User Data Stream ────────────────────────────────
   // These endpoints are "API-key only" — they require X-MBX-APIKEY header
   // but MUST NOT include signature/timestamp. Sending them as signed requests

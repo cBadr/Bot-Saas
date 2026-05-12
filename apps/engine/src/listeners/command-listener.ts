@@ -36,6 +36,11 @@ export class CommandListener {
         case 'EMERGENCY_STOP_USER':
           await this.manager.stopUserBots(cmd.userId, 'Emergency stop');
           break;
+        case 'CANCEL_PENDING':
+          // TODO: route to runner.cancelPending(); for now log so the API ack
+          // shows traceably in engine logs.
+          log.warn('CANCEL_PENDING received but engine handler not yet implemented', { botId: cmd.botId });
+          break;
       }
     } catch (err) {
       log.error('Command handler error', {

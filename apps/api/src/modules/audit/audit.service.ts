@@ -29,14 +29,28 @@ export class AuditService {
     });
   }
 
-  list(opts: { limit?: number; userId?: string; action?: string } = {}) {
+  list(opts: {
+    limit?: number;
+    userId?: string;
+    action?: string;
+    actorType?: string;
+    targetType?: string;
+    from?: string;
+    to?: string;
+  } = {}) {
+    const dateFilter: Record<string, Date> = {};
+    if (opts.from) dateFilter.gte = new Date(opts.from);
+    if (opts.to) dateFilter.lte = new Date(opts.to);
     return this.prisma.auditLog.findMany({
       where: {
         ...(opts.userId ? { userId: opts.userId } : {}),
-        ...(opts.action ? { action: opts.action } : {}),
+        ...(opts.action ? { action: { contains: opts.action, mode: 'insensitive' as const } } : {}),
+        ...(opts.actorType ? { actorType: opts.actorType } : {}),
+        ...(opts.targetType ? { targetType: opts.targetType } : {}),
+        ...(Object.keys(dateFilter).length ? { createdAt: dateFilter } : {}),
       },
       orderBy: { createdAt: 'desc' },
-      take: Math.min(500, opts.limit ?? 100),
+      take: Math.min(5000, opts.limit ?? 100),
     });
   }
 }

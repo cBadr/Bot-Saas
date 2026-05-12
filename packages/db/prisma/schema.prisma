@@ -205,6 +205,11 @@ model User {
   notificationLogs NotificationLog[]
   auditLogs      AuditLog[]
   systemLogs     SystemLog[]
+  couponRedemptions CouponRedemption[]
+  surveyResponses   SurveyResponse[]
+  approvalRequests  PendingApproval[]  @relation("ApprovalRequester")
+  portfolioSnapshots PortfolioSnapshot[]
+  priceAlerts        PriceAlert[]
 
   @@index([role])
   @@index([status])
@@ -258,7 +263,8 @@ model ExchangeApiKey {
   createdAt   DateTime     @default(now())
   updatedAt   DateTime     @updatedAt
 
-  bots Bot[]
+  bots               Bot[]
+  portfolioSnapshots PortfolioSnapshot[]
 
   @@index([userId])
   @@index([status])
@@ -346,6 +352,20 @@ model Bot {
   realizedPnlQuote  Decimal  @default(0) @db.Decimal(36, 18)
   unrealizedPnlQuote Decimal @default(0) @db.Decimal(36, 18)
 
+  // ─── Run-based lifecycle (a bot is a persistent template; each Start spawns a BotRun) ───
+  /** The currently-running session id, null when bot is stopped. */
+  currentRunId  String?  @unique
+  currentRun    BotRun?  @relation("BotCurrentRun", fields: [currentRunId], references: [id], onDelete: SetNull)
+  /** Soft-archive timestamp. Archived bots are hidden from default lists but data is preserved. */
+  archivedAt    DateTime?
+
+  // Lifetime aggregates (sum across all runs of this bot). Updated atomically on each run close.
+  totalRuns         Int      @default(0)
+  lifetimeRealized  Decimal  @default(0) @db.Decimal(36, 18)
+  lifetimeCycles    Int      @default(0)
+  lifetimeVolume    Decimal  @default(0) @db.Decimal(36, 18)
+  lifetimeFees      Decimal  @default(0) @db.Decimal(36, 18)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -353,23 +373,79 @@ model Bot {
   trades       Trade[]
   events       BotEvent[]
   performance  BotPerformanceSnapshot[]
+  runs         BotRun[]    @relation("BotRuns")
 
   @@index([userId])
   @@index([status])
   @@index([symbol])
   @@index([userId, status])
+  @@index([archivedAt])
+}
+
+// ─────────────────────────────────────────────────────
+// Bot Runs (one row per Start→Stop execution session)
+// ─────────────────────────────────────────────────────
+
+enum BotRunStatus {
+  RUNNING
+  STOPPED
+  ERROR
+}
+
+model BotRun {
+  id          String       @id @default(cuid())
+  botId       String
+  bot         Bot          @relation("BotRuns", fields: [botId], references: [id], onDelete: Cascade)
+  /** #1, #2, ... per-bot increment for human-readable run numbering. */
+  runNumber   Int
+
+  /** Snapshot of Bot.params at the moment Start was triggered (immutable). */
+  paramsSnapshot     Json
+  initialStartPrice  Decimal?  @db.Decimal(36, 18)
+
+  status      BotRunStatus @default(RUNNING)
+  startedAt   DateTime     @default(now())
+  stoppedAt   DateTime?
+  /** Why the run ended: user_stop / risk_limit / error / cycle_complete / engine_shutdown */
+  stopReason  String?
+
+  // Final stats snapshot — filled when status moves out of RUNNING.
+  realizedPnl       Decimal  @default(0) @db.Decimal(36, 18)
+  unrealizedAtStop  Decimal? @db.Decimal(36, 18)
+  cyclesCompleted   Int      @default(0)
+  tradesCount       Int      @default(0)
+  volumeQuote       Decimal  @default(0) @db.Decimal(36, 18)
+  fees              Decimal  @default(0) @db.Decimal(36, 18)
+  maxDrawdownAbs    Decimal? @db.Decimal(36, 18)
+  durationMs        BigInt?
+  /** Optional error message when stopReason='error'. */
+  errorMessage      String?
+
+  // Back-reference for the active-run pointer (a BotRun is referenced as Bot.currentRun).
+  currentForBot Bot? @relation("BotCurrentRun")
+
+  trades  Trade[]
+  events  BotEvent[]
+
+  @@unique([botId, runNumber])
+  @@index([botId, startedAt(sort: Desc)])
+  @@index([status])
 }
 
 model BotEvent {
   id        String   @id @default(cuid())
   botId     String
   bot       Bot      @relation(fields: [botId], references: [id], onDelete: Cascade)
+  /** Optional reference to the specific run during which this event happened. */
+  botRunId  String?
+  botRun    BotRun?  @relation(fields: [botRunId], references: [id], onDelete: SetNull)
   type      String   // STARTED, STOPPED, ERROR, ORDER_PLACED, ORDER_FILLED, etc.
   message   String
   data      Json?
   createdAt DateTime @default(now())
 
   @@index([botId, createdAt(sort: Desc)])
+  @@index([botRunId])
   @@index([type])
 }
 
@@ -431,6 +507,9 @@ model Trade {
   id              String   @id @default(cuid())
   botId           String
   bot             Bot      @relation(fields: [botId], references: [id], onDelete: Cascade)
+  /** Optional reference to the specific run that produced this trade. */
+  botRunId        String?
+  botRun          BotRun?  @relation(fields: [botRunId], references: [id], onDelete: SetNull)
   orderId         String
   order           Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
 
@@ -450,6 +529,7 @@ model Trade {
 
   @@unique([exchangeTradeId, symbol])
   @@index([botId, executedAt(sort: Desc)])
+  @@index([botRunId])
   @@index([symbol])
 }
 
@@ -639,7 +719,178 @@ model FeatureFlag {
   rolloutPct   Int      @default(0)
   // Optional list of userIds to specifically include
   allowList    String[]
+  /**
+   * Advanced targeting rules (JSON). Recognized keys:
+   *   roles?: ('USER' | 'PRO' | 'ADMIN' | 'SUPER_ADMIN')[]
+   *   plans?: string[]            // plan codes (e.g. ['pro', 'elite'])
+   *   countries?: string[]        // ISO-2 codes
+   *   signupAfter?: string        // ISO date — only users created after
+   *   signupBefore?: string       // ISO date
+   *   minBots?: number
+   *   trialOnly?: boolean
+   * Empty object = no targeting (rolloutPct + allowList still apply).
+   */
+  targeting    Json     @default("{}")
   updatedAt    DateTime @updatedAt
+}
+
+// ─────────────────────────────────────────────────────
+// Wallet — portfolio snapshots & price alerts
+// ─────────────────────────────────────────────────────
+
+model PortfolioSnapshot {
+  id              String   @id @default(cuid())
+  apiKeyId        String
+  apiKey          ExchangeApiKey @relation(fields: [apiKeyId], references: [id], onDelete: Cascade)
+  userId          String
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  totalValueUsd   Decimal  @db.Decimal(24, 8)
+  assetCount      Int
+  /** Per-asset breakdown {asset: total, value} */
+  breakdown       Json
+  createdAt       DateTime @default(now())
+
+  @@index([apiKeyId, createdAt(sort: Desc)])
+  @@index([userId])
+}
+
+model PriceAlert {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  symbol      String   // e.g. "BTCFDUSD"
+  asset       String   // user-facing asset name, e.g. "BTC"
+  /** ABOVE = trigger when market >= threshold; BELOW = trigger when market <= threshold. */
+  direction   String
+  threshold   Decimal  @db.Decimal(24, 8)
+  /** Notes the user can attach (e.g. "buy zone", "stop loss target"). */
+  note        String?
+  enabled     Boolean  @default(true)
+  triggeredAt DateTime?
+  triggeredPrice Decimal? @db.Decimal(24, 8)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([userId, enabled])
+  @@index([symbol])
+}
+
+// ─────────────────────────────────────────────────────
+// Coupons & Redemptions (Sprint 4)
+// ─────────────────────────────────────────────────────
+
+model Coupon {
+  id              String   @id @default(cuid())
+  code            String   @unique
+  description     String?
+  /** PERCENT (0..100) or FIXED amount in USD. */
+  discountType    String   // 'PERCENT' | 'FIXED'
+  discountValue   Decimal  @db.Decimal(12, 2)
+  /** Optional plan codes the coupon applies to. Empty = any plan. */
+  applicablePlans String[]
+  maxRedemptions  Int?     // null = unlimited
+  perUserLimit    Int      @default(1)
+  validFrom       DateTime @default(now())
+  validUntil      DateTime?
+  isActive        Boolean  @default(true)
+  redemptionCount Int      @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  redemptions CouponRedemption[]
+
+  @@index([isActive])
+  @@index([validUntil])
+}
+
+model CouponRedemption {
+  id         String   @id @default(cuid())
+  couponId   String
+  coupon     Coupon   @relation(fields: [couponId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  paymentId  String?  // optional link to the payment that applied it
+  amountOff  Decimal  @db.Decimal(12, 2)
+  createdAt  DateTime @default(now())
+
+  @@index([couponId])
+  @@index([userId])
+  @@unique([couponId, userId, createdAt])
+}
+
+// ─────────────────────────────────────────────────────
+// Email templates (Sprint 4)
+// ─────────────────────────────────────────────────────
+
+model EmailTemplate {
+  id          String   @id @default(cuid())
+  key         String   @unique   // e.g. 'welcome', 'trial_ending', 'payment_failed'
+  name        String
+  subject     String
+  body        String              // markdown / HTML
+  variables   String[]            // declared variables like ['name', 'planCode']
+  isActive    Boolean  @default(true)
+  description String?
+  updatedAt   DateTime @updatedAt
+  createdAt   DateTime @default(now())
+}
+
+// ─────────────────────────────────────────────────────
+// NPS / Feedback surveys (Sprint 4)
+// ─────────────────────────────────────────────────────
+
+model SurveyResponse {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  surveyKey String   @default("nps")  // 'nps' | 'churn_reason' | custom
+  score     Int?     // 0..10 for NPS
+  category  String?  // 'promoter' | 'passive' | 'detractor' (auto-computed for NPS)
+  comment   String?
+  metadata  Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([surveyKey, createdAt(sort: Desc)])
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────────────────
+// Two-Person Approvals (Sprint 4)
+// ─────────────────────────────────────────────────────
+
+model PendingApproval {
+  id              String   @id @default(cuid())
+  /** What action requires approval (e.g. 'payment.refund', 'user.role.change') */
+  action          String
+  /** Target type/id for the action */
+  targetType      String?
+  targetId        String?
+  /** Action payload — replayed when approved */
+  payload         Json
+  /** Who requested the action */
+  requestedBy     String
+  requestedByUser User     @relation("ApprovalRequester", fields: [requestedBy], references: [id], onDelete: Cascade)
+  reason          String?
+  /** Who approved (must differ from requestedBy) */
+  approvedBy      String?
+  approvedAt      DateTime?
+  /** Set if rejected */
+  rejectedBy      String?
+  rejectedAt      DateTime?
+  rejectionReason String?
+  /** Set after the approved action was successfully replayed */
+  executedAt      DateTime?
+  executionResult Json?
+  /** Auto-expires after a TTL (default 24h) */
+  expiresAt       DateTime
+  createdAt       DateTime @default(now())
+
+  @@index([action])
+  @@index([requestedBy])
+  @@index([expiresAt])
+  @@index([approvedAt])
 }
 
 // ─────────────────────────────────────────────────────

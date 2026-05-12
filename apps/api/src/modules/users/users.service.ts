@@ -55,21 +55,70 @@ export class UsersService {
     return { success: true };
   }
 
-  async getProfile(userId: string) {
-    const user = await this.prisma.user.findUnique({
-      where: { id: userId },
-      select: {
-        id: true, email: true, fullName: true, avatarUrl: true,
-        role: true, status: true, twoFactorEnabled: true,
-        telegramChatId: true, telegramUsername: true,
-        discordWebhookUrl: true, pushSubscriptions: true,
-        fillFrequency: true, notificationConfig: true, lastStatusReportAt: true,
-        trialEndsAt: true,
-        referralCode: true, createdAt: true, lastLoginAt: true,
+  /**
+   * Submit an NPS / feedback response. `score` 0..10 is required for NPS;
+   * `category` is auto-computed (promoter / passive / detractor).
+   */
+  async submitSurvey(userId: string, input: {
+    surveyKey?: string; score?: number; comment?: string;
+    metadata?: Record<string, unknown>;
+  }) {
+    const surveyKey = input.surveyKey ?? 'nps';
+    let category: string | null = null;
+    if (typeof input.score === 'number') {
+      if (input.score >= 9) category = 'promoter';
+      else if (input.score >= 7) category = 'passive';
+      else category = 'detractor';
+    }
+    return this.prisma.surveyResponse.create({
+      data: {
+        userId,
+        surveyKey,
+        score: input.score ?? null,
+        category,
+        comment: input.comment,
+        metadata: (input.metadata ?? {}) as object,
       },
+      select: { id: true, createdAt: true },
     });
+  }
+
+  async getProfile(userId: string) {
+    const [user, announcement] = await Promise.all([
+      this.prisma.user.findUnique({
+        where: { id: userId },
+        select: {
+          id: true, email: true, fullName: true, avatarUrl: true,
+          role: true, status: true, twoFactorEnabled: true,
+          telegramChatId: true, telegramUsername: true,
+          discordWebhookUrl: true, pushSubscriptions: true,
+          fillFrequency: true, notificationConfig: true, lastStatusReportAt: true,
+          trialEndsAt: true,
+          referralCode: true, createdAt: true, lastLoginAt: true,
+        },
+      }),
+      this.prisma.appSetting.findUnique({ where: { key: 'ANNOUNCEMENT_BANNER' } }),
+    ]);
     if (!user) throw new NotFoundException('User not found');
-    return user;
+    // Surface admin announcement so the dashboard layout can render a banner
+    // without an extra round trip. Only an enabled announcement is exposed.
+    const ann = announcement?.value as null | {
+      enabled?: boolean; message?: string; severity?: string;
+      startsAt?: string; endsAt?: string;
+    };
+    let activeAnnouncement: { message: string; severity: 'info' | 'warning' | 'critical' } | null = null;
+    if (ann?.enabled && ann.message) {
+      const now = Date.now();
+      const startsOk = !ann.startsAt || new Date(ann.startsAt).getTime() <= now;
+      const endsOk = !ann.endsAt || new Date(ann.endsAt).getTime() >= now;
+      if (startsOk && endsOk) {
+        activeAnnouncement = {
+          message: ann.message,
+          severity: (ann.severity ?? 'info') as 'info' | 'warning' | 'critical',
+        };
+      }
+    }
+    return { ...user, announcement: activeAnnouncement };
   }
 
   async updateProfile(
@@ -81,17 +130,12 @@ export class UsersService {
       telegramUsername?: string | null;
       discordWebhookUrl?: string | null;
       fillFrequency?: 'OFF' | 'PER_CYCLE' | 'PER_FILL' | 'CUSTOM';
-      notificationConfig?: {
-        notifyOnBuyFills?: boolean;
-        notifyOnSellFills?: boolean;
-        minFillNotional?: number;
-        minCyclePnl?: number;
-      };
+      notificationConfig?: Record<string, unknown>;
     },
   ) {
     return this.prisma.user.update({
       where: { id: userId },
-      data,
+      data: data as never,
       select: {
         id: true, email: true, fullName: true, avatarUrl: true,
         telegramChatId: true, telegramUsername: true,
@@ -99,6 +143,136 @@ export class UsersService {
         fillFrequency: true, notificationConfig: true,
       },
     });
+  }
+
+  /** List the user's active (non-revoked, non-expired) sessions. */
+  async listSessions(userId: string) {
+    const now = new Date();
+    return this.prisma.session.findMany({
+      where: { userId, revokedAt: null, expiresAt: { gt: now } },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true, userAgent: true, ipAddress: true,
+        expiresAt: true, createdAt: true,
+      },
+    });
+  }
+
+  async revokeSession(userId: string, sessionId: string) {
+    const s = await this.prisma.session.findUnique({ where: { id: sessionId } });
+    if (!s || s.userId !== userId) throw new NotFoundException('Session not found');
+    if (s.revokedAt) return { ok: true };
+    await this.prisma.session.update({
+      where: { id: sessionId },
+      data: { revokedAt: new Date() },
+    });
+    return { ok: true };
+  }
+
+  async revokeAllSessions(userId: string) {
+    const r = await this.prisma.session.updateMany({
+      where: { userId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+    return { revoked: r.count };
+  }
+
+  /** Recent audit log entries for the user (last 200). */
+  async auditLog(userId: string) {
+    return this.prisma.auditLog.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+      take: 200,
+      select: {
+        id: true, action: true, actorType: true,
+        targetType: true, targetId: true,
+        ipAddress: true, userAgent: true,
+        metadata: true, createdAt: true,
+      },
+    });
+  }
+
+  /** Referral counts + share link. */
+  async referralStats(userId: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { referralCode: true },
+    });
+    if (!user) throw new NotFoundException('User not found');
+    const count = await this.prisma.user.count({ where: { referredById: userId } });
+    const recent = await this.prisma.user.findMany({
+      where: { referredById: userId },
+      orderBy: { createdAt: 'desc' },
+      take: 20,
+      select: { id: true, email: true, createdAt: true },
+    });
+    // Mask emails to avoid full PII exposure (e.g., j***@example.com).
+    const maskedRecent = recent.map((r) => ({
+      id: r.id,
+      email: maskEmail(r.email),
+      createdAt: r.createdAt,
+    }));
+    return { code: user.referralCode, count, recent: maskedRecent };
+  }
+
+  /**
+   * GDPR data export — full JSON dump of every record tied to the user.
+   * Volume can be large, so prefer the dedicated CSV exports for trades.
+   */
+  async exportData(userId: string) {
+    const [user, bots, apiKeys, sessions, audit, payments, subscriptions, trades, events] = await Promise.all([
+      this.prisma.user.findUnique({ where: { id: userId } }),
+      this.prisma.bot.findMany({ where: { userId } }),
+      this.prisma.exchangeApiKey.findMany({ where: { userId }, select: { id: true, exchange: true, label: true, status: true, createdAt: true } }),
+      this.prisma.session.findMany({ where: { userId }, select: { id: true, userAgent: true, ipAddress: true, expiresAt: true, createdAt: true, revokedAt: true } }),
+      this.prisma.auditLog.findMany({ where: { userId }, orderBy: { createdAt: 'desc' }, take: 1000 }),
+      this.prisma.payment.findMany({ where: { userId } }),
+      this.prisma.subscription.findMany({ where: { userId } }),
+      this.prisma.trade.findMany({ where: { bot: { userId } }, take: 5000, orderBy: { executedAt: 'desc' } }),
+      this.prisma.botEvent.findMany({ where: { bot: { userId } }, take: 5000, orderBy: { createdAt: 'desc' } }),
+    ]);
+    // Strip sensitive fields before returning.
+    const safeUser = user ? {
+      ...user,
+      passwordHash: undefined,
+      twoFactorSecret: undefined,
+    } : null;
+    return {
+      exportedAt: new Date().toISOString(),
+      user: safeUser,
+      bots, apiKeys, sessions, audit, payments, subscriptions,
+      trades: trades.length,
+      events: events.length,
+      tradesSample: trades.slice(0, 100),
+      eventsSample: events.slice(0, 100),
+      note: 'For full trade history, use the per-bot CSV export endpoint.',
+    };
+  }
+
+  /**
+   * Account deletion. Requires the user to type their email to confirm.
+   * This is a hard delete via Prisma cascade — bots, trades, events, etc. all go.
+   * Production-grade would soft-delete with a 30-day grace period; for now,
+   * we go straight delete to keep scope contained.
+   */
+  async deleteAccount(userId: string, confirmEmail: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { email: true, status: true },
+    });
+    if (!user) throw new NotFoundException('User not found');
+    if (user.email.toLowerCase() !== confirmEmail.toLowerCase()) {
+      throw new BadRequestException('Email confirmation does not match');
+    }
+    // Block deletion while bots are running — user must stop them first.
+    const running = await this.prisma.bot.count({
+      where: { userId, status: { in: ['RUNNING', 'STARTING', 'PAUSED'] } },
+    });
+    if (running > 0) {
+      throw new BadRequestException(`Stop all ${running} active bot(s) before deleting your account.`);
+    }
+    await this.prisma.user.delete({ where: { id: userId } });
+    return { deleted: true };
   }
 
   /** Send a test message via Resend to the user's email. */
@@ -230,4 +404,11 @@ export class UsersService {
     });
     return { success: true };
   }
+}
+
+function maskEmail(email: string): string {
+  const [local, domain] = email.split('@');
+  if (!domain) return '***';
+  const head = local.slice(0, 1);
+  return `${head}${'*'.repeat(Math.max(1, local.length - 1))}@${domain}`;
 }

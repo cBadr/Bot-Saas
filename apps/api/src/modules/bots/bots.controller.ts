@@ -1,4 +1,5 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, Query, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Header, Param, Patch, Post, Query, Res, UseGuards } from '@nestjs/common';
+import type { Response } from 'express';
 import { z } from 'zod';
 import { JwtAuthGuard } from '../auth/guards';
 import { CurrentUser, type CurrentUserPayload } from '../../common/decorators/current-user.decorator';
@@ -30,8 +31,8 @@ export class BotsController {
   constructor(private readonly bots: BotsService) {}
 
   @Get()
-  list(@CurrentUser() u: CurrentUserPayload) {
-    return this.bots.list(u.sub);
+  list(@CurrentUser() u: CurrentUserPayload, @Query('archived') archived?: string) {
+    return this.bots.list(u.sub, { includeArchived: archived === 'true' });
   }
 
   @Get(':id')
@@ -92,6 +93,71 @@ export class BotsController {
   @Post('recompute-stats')
   recomputeAllForUser(@CurrentUser() u: CurrentUserPayload) {
     return this.bots.recomputeAllForUser(u.sub);
+  }
+
+  @Post(':id/clone')
+  clone(
+    @CurrentUser() u: CurrentUserPayload,
+    @Param('id') id: string,
+    @Body() body: { name?: string; symbol?: string } = {},
+  ) {
+    return this.bots.clone(u.sub, id, body);
+  }
+
+  @Get(':id/snapshot')
+  snapshot(@CurrentUser() u: CurrentUserPayload, @Param('id') id: string) {
+    return this.bots.snapshot(u.sub, id);
+  }
+
+  @Get(':id/export/trades.csv')
+  @Header('Content-Type', 'text/csv; charset=utf-8')
+  async exportTradesCsv(
+    @CurrentUser() u: CurrentUserPayload,
+    @Param('id') id: string,
+    @Res() res: Response,
+  ) {
+    const csv = await this.bots.exportTradesCsv(u.sub, id);
+    res.setHeader('Content-Disposition', `attachment; filename="bot-${id}-trades.csv"`);
+    res.send(csv);
+  }
+
+  @Post(':id/cancel-pending')
+  cancelPending(@CurrentUser() u: CurrentUserPayload, @Param('id') id: string) {
+    return this.bots.cancelPendingOrders(u.sub, id);
+  }
+
+  @Get(':id/runs')
+  runs(@CurrentUser() u: CurrentUserPayload, @Param('id') id: string) {
+    return this.bots.listRuns(u.sub, id);
+  }
+
+  @Get(':id/runs/:runId')
+  run(@CurrentUser() u: CurrentUserPayload, @Param('id') id: string, @Param('runId') runId: string) {
+    return this.bots.getRun(u.sub, id, runId);
+  }
+
+  @Post(':id/runs/:runId/replay')
+  replayRun(@CurrentUser() u: CurrentUserPayload, @Param('id') id: string, @Param('runId') runId: string) {
+    return this.bots.replayRun(u.sub, id, runId);
+  }
+
+  @Patch(':id/params')
+  updateParams(
+    @CurrentUser() u: CurrentUserPayload,
+    @Param('id') id: string,
+    @Body() body: { params: Record<string, unknown> },
+  ) {
+    return this.bots.updateParams(u.sub, id, body.params ?? {});
+  }
+
+  @Post(':id/archive')
+  archive(@CurrentUser() u: CurrentUserPayload, @Param('id') id: string) {
+    return this.bots.archiveBot(u.sub, id);
+  }
+
+  @Post(':id/unarchive')
+  unarchive(@CurrentUser() u: CurrentUserPayload, @Param('id') id: string) {
+    return this.bots.unarchiveBot(u.sub, id);
   }
 
   @Delete(':id')

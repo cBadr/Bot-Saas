@@ -1,11 +1,15 @@
 import axios, { type AxiosInstance } from 'axios';
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'https://orcax.click/api/v1';
+const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:4000/api/v1';
 
 export interface ApiResponse<T> { ok: boolean; data?: T; error?: { code: string; message: string; details?: unknown } }
 
 const ACCESS_KEY = 'orca_access_token';
 const REFRESH_KEY = 'orca_refresh_token';
+// Backup keys used during admin impersonation so the admin can exit cleanly.
+const ADMIN_ACCESS_KEY = 'orca_admin_access_token';
+const ADMIN_REFRESH_KEY = 'orca_admin_refresh_token';
+const IMPERSONATED_EMAIL_KEY = 'orca_impersonated_email';
 
 export const tokenStore = {
   get access() { return typeof window === 'undefined' ? null : localStorage.getItem(ACCESS_KEY); },
@@ -19,6 +23,35 @@ export const tokenStore = {
     if (typeof window === 'undefined') return;
     localStorage.removeItem(ACCESS_KEY);
     localStorage.removeItem(REFRESH_KEY);
+    localStorage.removeItem(ADMIN_ACCESS_KEY);
+    localStorage.removeItem(ADMIN_REFRESH_KEY);
+    localStorage.removeItem(IMPERSONATED_EMAIL_KEY);
+  },
+  // ─── Impersonation helpers ───
+  /** Swap to the target user's token, stashing the admin's tokens for exit. */
+  startImpersonation(targetAccess: string, targetEmail: string) {
+    if (typeof window === 'undefined') return;
+    const adminAccess = localStorage.getItem(ACCESS_KEY);
+    const adminRefresh = localStorage.getItem(REFRESH_KEY);
+    if (adminAccess) localStorage.setItem(ADMIN_ACCESS_KEY, adminAccess);
+    if (adminRefresh) localStorage.setItem(ADMIN_REFRESH_KEY, adminRefresh);
+    localStorage.setItem(ACCESS_KEY, targetAccess);
+    localStorage.removeItem(REFRESH_KEY);  // no refresh during impersonation
+    localStorage.setItem(IMPERSONATED_EMAIL_KEY, targetEmail);
+  },
+  /** Restore the admin's tokens. */
+  exitImpersonation() {
+    if (typeof window === 'undefined') return;
+    const a = localStorage.getItem(ADMIN_ACCESS_KEY);
+    const r = localStorage.getItem(ADMIN_REFRESH_KEY);
+    if (a) localStorage.setItem(ACCESS_KEY, a); else localStorage.removeItem(ACCESS_KEY);
+    if (r) localStorage.setItem(REFRESH_KEY, r); else localStorage.removeItem(REFRESH_KEY);
+    localStorage.removeItem(ADMIN_ACCESS_KEY);
+    localStorage.removeItem(ADMIN_REFRESH_KEY);
+    localStorage.removeItem(IMPERSONATED_EMAIL_KEY);
+  },
+  get impersonatedEmail() {
+    return typeof window === 'undefined' ? null : localStorage.getItem(IMPERSONATED_EMAIL_KEY);
   },
 };
 

@@ -229,6 +229,67 @@ export class WalletService {
     return r;
   }
 
+  /**
+   * Cancel all open orders on this API key. By default, only "manual" wallet
+   * orders are cancelled (clientOrderId starting with `orca-wallet`). Pass
+   * `includeBots=true` to also cancel bot-placed orders — DANGEROUS: this
+   * leaves the bot's internal state out of sync with Binance until the next
+   * integrity reconcile (~60s), which will then re-place them.
+   *
+   * Optionally scope by `symbol` to limit the operation.
+   */
+  async cancelAllOpenOrders(userId: string, apiKeyId: string, opts: {
+    symbol?: string;
+    includeBots?: boolean;
+  } = {}) {
+    const client = await this.getClient(userId, apiKeyId);
+    const open = await client.getOpenOrders(opts.symbol?.toUpperCase());
+    if (open.length === 0) {
+      return { cancelled: 0, skipped: 0, failed: 0, total: 0 };
+    }
+
+    type OpenOrder = (typeof open)[number];
+    const matches: OpenOrder[] = [];
+    let skipped = 0;
+    for (const o of open) {
+      const cid = (o as { clientOrderId?: string }).clientOrderId ?? '';
+      const isManual = cid.startsWith('orca-wallet');
+      const isBot = cid.startsWith('orca-') && !isManual;
+      if (!opts.includeBots && isBot) { skipped++; continue; }
+      matches.push(o);
+    }
+    if (matches.length === 0) {
+      return { cancelled: 0, skipped, failed: 0, total: open.length };
+    }
+
+    // Group by symbol → batchCancelOrders supports per-symbol parallelism.
+    const bySymbol = new Map<string, string[]>();
+    for (const o of matches) {
+      const cid = (o as { clientOrderId?: string }).clientOrderId;
+      const sym = (o as { symbol: string }).symbol;
+      if (!cid) continue;
+      const arr = bySymbol.get(sym) ?? [];
+      arr.push(cid);
+      bySymbol.set(sym, arr);
+    }
+    let cancelled = 0, failed = 0;
+    for (const [sym, cids] of bySymbol) {
+      const results = await client.batchCancelOrders(sym, cids, { concurrency: 20 });
+      for (const r of results) {
+        if (r.ok) cancelled++;
+        else {
+          // Already filled/canceled errors are not real failures.
+          const err = r.error as { response?: { data?: { code?: number } } };
+          const code = err.response?.data?.code;
+          if (code === -2011 || code === -2013) cancelled++;
+          else failed++;
+        }
+      }
+    }
+    log.info('Wallet cancel-all', { userId, apiKeyId, cancelled, skipped, failed, total: open.length });
+    return { cancelled, skipped, failed, total: open.length };
+  }
+
   /** Open orders for this API key (for wallet trades + bot orders). */
   async openOrders(userId: string, apiKeyId: string, symbol?: string) {
     const client = await this.getClient(userId, apiKeyId);
@@ -241,4 +302,297 @@ export class WalletService {
     const client = await this.getClient(userId, apiKeyId);
     return client.getMyTrades({ symbol: symbol.toUpperCase(), limit: Math.min(500, limit) });
   }
+
+  // ─────────────────────────── Phase 2: portfolio analytics ───────────────────────────
+
+  /** Portfolio overview enriched with 24h ticker stats per holding. */
+  async overviewWithChanges(userId: string, apiKeyId: string) {
+    const overview = await this.overview(userId, apiKeyId);
+    const symbols = overview.balances
+      .filter((b) => b.tradeable)
+      .map((b) => `${b.asset}${FEE_FREE_QUOTE_ASSET}`);
+    const changes24h = new Map<string, { changePct: number; change: number; high: number; low: number; volume: number }>();
+    if (symbols.length > 0) {
+      try {
+        const { request } = await import('undici');
+        // Binance lets us batch via ?symbols=["A","B"] (URL-encoded JSON array).
+        const symbolsParam = encodeURIComponent(JSON.stringify(symbols));
+        const r = await request(`${env.BINANCE_BASE_URL}/api/v3/ticker/24hr?symbols=${symbolsParam}`);
+        if (r.statusCode === 200) {
+          const data = (await r.body.json()) as Array<{
+            symbol: string; priceChange: string; priceChangePercent: string;
+            highPrice: string; lowPrice: string; volume: string;
+          }>;
+          for (const d of data) {
+            changes24h.set(d.symbol, {
+              changePct: Number(d.priceChangePercent),
+              change: Number(d.priceChange),
+              high: Number(d.highPrice),
+              low: Number(d.lowPrice),
+              volume: Number(d.volume),
+            });
+          }
+        }
+      } catch (err) { log.warn('24hr ticker fetch failed', { err: String(err) }); }
+    }
+    // Enrich balances with 24h change + compute portfolio 24h delta.
+    let portfolioChange24h = 0;
+    let portfolioValue24hAgo = 0;
+    const enriched = overview.balances.map((b) => {
+      const ch = b.tradeable ? changes24h.get(`${b.asset}${FEE_FREE_QUOTE_ASSET}`) ?? null : null;
+      const valueNow = Number(b.fdusdValue);
+      if (ch !== null && valueNow > 0) {
+        const valueThen = valueNow / (1 + ch.changePct / 100);
+        portfolioValue24hAgo += valueThen;
+        portfolioChange24h += valueNow - valueThen;
+      } else {
+        portfolioValue24hAgo += valueNow;  // assume stable (FDUSD itself)
+      }
+      return { ...b, change24h: ch };
+    });
+    const portfolioChangePct24h = portfolioValue24hAgo > 0
+      ? ((Number(overview.totalFdusdValue) - portfolioValue24hAgo) / portfolioValue24hAgo) * 100
+      : 0;
+    return {
+      ...overview,
+      balances: enriched,
+      change24h: {
+        absolute: portfolioChange24h,
+        percentage: portfolioChangePct24h,
+        valueAgo: portfolioValue24hAgo,
+      },
+    };
+  }
+
+  /** Deposit history from Binance (last 90 days). */
+  async deposits(userId: string, apiKeyId: string) {
+    const client = await this.getClient(userId, apiKeyId);
+    const rows = await client.getDepositHistory({ limit: 500 });
+    return rows.map((r) => ({
+      coin: r.coin, network: r.network, amount: r.amount,
+      status: r.status, address: r.address, addressTag: r.addressTag ?? null,
+      txId: r.txId, insertTime: r.insertTime,
+      walletType: r.walletType,
+    }));
+  }
+
+  /** Withdrawal history from Binance (last 90 days). */
+  async withdrawals(userId: string, apiKeyId: string) {
+    const client = await this.getClient(userId, apiKeyId);
+    const rows = await client.getWithdrawHistory({ limit: 500 });
+    return rows.map((r) => ({
+      coin: r.coin, network: r.network, amount: r.amount,
+      transactionFee: r.transactionFee, status: r.status,
+      address: r.address, addressTag: r.addressTag ?? null,
+      txId: r.txId, applyTime: r.applyTime,
+    }));
+  }
+
+  /** Convert dust balances (< 0.001 BTC equiv) to BNB. */
+  async convertDust(userId: string, apiKeyId: string, assets: string[]) {
+    if (!assets.length) throw new BadRequestException('Pass at least one asset');
+    const client = await this.getClient(userId, apiKeyId);
+    return client.convertDust(assets);
+  }
+
+  /**
+   * Aggregate trade history across multiple symbols (held + recent).
+   * Optional date filters; capped at ~1000 rows.
+   */
+  async allTrades(userId: string, apiKeyId: string, opts: {
+    symbols?: string[]; from?: string; to?: string; limit?: number;
+  } = {}) {
+    const client = await this.getClient(userId, apiKeyId);
+    let symbols = opts.symbols;
+    if (!symbols || symbols.length === 0) {
+      // Default: every held asset's <X>FDUSD pair, since that's where most trading happens.
+      const overview = await this.overview(userId, apiKeyId);
+      symbols = overview.balances
+        .filter((b) => b.tradeable)
+        .slice(0, 10) // cap to 10 symbols to bound the API calls
+        .map((b) => `${b.asset}${FEE_FREE_QUOTE_ASSET}`);
+    }
+    const startTime = opts.from ? new Date(opts.from).getTime() : undefined;
+    const limit = Math.min(1000, opts.limit ?? 500);
+    const perSymbol = Math.max(50, Math.floor(limit / Math.max(1, symbols.length)));
+    const all: Array<{
+      symbol: string; id: number; orderId: number; price: string;
+      qty: string; quoteQty: string; commission: string; commissionAsset: string;
+      time: number; isBuyer: boolean; isMaker: boolean;
+    }> = [];
+    for (const sym of symbols) {
+      try {
+        const rows = await client.getMyTrades({
+          symbol: sym,
+          ...(startTime ? { startTime } : {}),
+          limit: perSymbol,
+        }) as never as typeof all;
+        for (const r of rows) all.push({ ...r, symbol: sym });
+      } catch (err) {
+        log.warn('getMyTrades failed', { symbol: sym, err: String(err) });
+      }
+    }
+    all.sort((a, b) => b.time - a.time);
+    return all.slice(0, limit);
+  }
+
+  /** CSV-formatted trade export. */
+  async exportTradesCsv(userId: string, apiKeyId: string, from?: string, to?: string): Promise<string> {
+    const trades = await this.allTrades(userId, apiKeyId, { from, to, limit: 1000 });
+    const header = ['time', 'symbol', 'side', 'price', 'qty', 'quoteQty', 'commission', 'commissionAsset', 'isMaker', 'orderId', 'tradeId'].join(',');
+    const rows = trades.map((t) => [
+      new Date(t.time).toISOString(),
+      t.symbol,
+      t.isBuyer ? 'BUY' : 'SELL',
+      t.price, t.qty, t.quoteQty,
+      t.commission, t.commissionAsset,
+      t.isMaker ? '1' : '0',
+      String(t.orderId), String(t.id),
+    ].map(csvEscape).join(','));
+    return [header, ...rows].join('\n');
+  }
+
+  /**
+   * Per-asset cost-basis snapshot reconstructed from trade history:
+   *   avgBuyPrice = Σ(buy_price × buy_qty) / Σ(buy_qty)
+   *   currentValue, unrealized P&L, and rank.
+   */
+  async costBasis(userId: string, apiKeyId: string) {
+    const overview = await this.overview(userId, apiKeyId);
+    const tradeableBalances = overview.balances.filter((b) => b.tradeable && Number(b.total) > 0);
+
+    const result: Array<{
+      asset: string;
+      symbol: string;
+      heldQty: number;
+      heldValue: number;
+      avgBuyPrice: number | null;
+      totalBuyQty: number;
+      totalBuyCost: number;
+      totalSellQty: number;
+      totalSellProceeds: number;
+      realizedPnl: number;
+      unrealizedPnl: number | null;
+      currentPrice: number;
+    }> = [];
+
+    const client = await this.getClient(userId, apiKeyId);
+    for (const b of tradeableBalances) {
+      const symbol = `${b.asset}${FEE_FREE_QUOTE_ASSET}`;
+      try {
+        const trades = await client.getMyTrades({ symbol, limit: 1000 }) as never as Array<{
+          price: string; qty: string; quoteQty: string; commission: string;
+          isBuyer: boolean;
+        }>;
+        let buyQty = 0, buyCost = 0, sellQty = 0, sellProceeds = 0;
+        for (const t of trades) {
+          const q = Number(t.qty);
+          const cost = Number(t.quoteQty);
+          if (t.isBuyer) { buyQty += q; buyCost += cost; }
+          else { sellQty += q; sellProceeds += cost; }
+        }
+        const avgBuyPrice = buyQty > 0 ? buyCost / buyQty : null;
+        const realizedPnl = sellProceeds - (avgBuyPrice ? avgBuyPrice * sellQty : 0);
+        const heldQty = Number(b.total);
+        const currentPrice = b.fdusdPrice ? Number(b.fdusdPrice) : 0;
+        const unrealizedPnl = avgBuyPrice !== null && currentPrice > 0
+          ? (currentPrice - avgBuyPrice) * heldQty
+          : null;
+        result.push({
+          asset: b.asset, symbol,
+          heldQty, heldValue: Number(b.fdusdValue),
+          avgBuyPrice, totalBuyQty: buyQty, totalBuyCost: buyCost,
+          totalSellQty: sellQty, totalSellProceeds: sellProceeds,
+          realizedPnl, unrealizedPnl, currentPrice,
+        });
+      } catch (err) {
+        log.warn('costBasis getMyTrades failed', { symbol, err: String(err) });
+      }
+    }
+    return result.sort((a, b) => b.heldValue - a.heldValue);
+  }
+
+  // ─────────────────────────── Portfolio Snapshots ───────────────────────────
+
+  /** Save a portfolio snapshot for the apiKey (manual or cron-triggered). */
+  async snapshotNow(userId: string, apiKeyId: string) {
+    const overview = await this.overview(userId, apiKeyId);
+    const breakdown = overview.balances.map((b) => ({
+      asset: b.asset, total: b.total, value: Number(b.fdusdValue),
+    }));
+    return this.prisma.portfolioSnapshot.create({
+      data: {
+        apiKeyId, userId,
+        totalValueUsd: Number(overview.totalFdusdValue),
+        assetCount: overview.assetCount,
+        breakdown: breakdown as object,
+      },
+      select: { id: true, createdAt: true, totalValueUsd: true },
+    });
+  }
+
+  /** Return up to `days` of recent snapshots, oldest first. */
+  async snapshots(userId: string, apiKeyId: string, days = 30) {
+    // Verify ownership.
+    const k = await this.prisma.exchangeApiKey.findUnique({ where: { id: apiKeyId } });
+    if (!k || k.userId !== userId) throw new ForbiddenException();
+    const since = new Date(Date.now() - days * 86_400_000);
+    const rows = await this.prisma.portfolioSnapshot.findMany({
+      where: { apiKeyId, createdAt: { gte: since } },
+      orderBy: { createdAt: 'asc' },
+      select: { createdAt: true, totalValueUsd: true, assetCount: true },
+    });
+    return rows.map((r) => ({
+      ts: r.createdAt.getTime(),
+      value: Number(r.totalValueUsd),
+      assets: r.assetCount,
+    }));
+  }
+
+  // ─────────────────────────── Price Alerts ───────────────────────────
+
+  async listAlerts(userId: string) {
+    return this.prisma.priceAlert.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  async createAlert(userId: string, input: {
+    symbol: string; asset: string;
+    direction: 'ABOVE' | 'BELOW'; threshold: number;
+    note?: string;
+  }) {
+    return this.prisma.priceAlert.create({
+      data: {
+        userId,
+        symbol: input.symbol.toUpperCase(),
+        asset: input.asset.toUpperCase(),
+        direction: input.direction,
+        threshold: input.threshold,
+        note: input.note,
+      },
+    });
+  }
+
+  async deleteAlert(userId: string, id: string) {
+    const a = await this.prisma.priceAlert.findUnique({ where: { id } });
+    if (!a || a.userId !== userId) throw new NotFoundException('Alert not found');
+    await this.prisma.priceAlert.delete({ where: { id } });
+    return { ok: true };
+  }
+
+  async toggleAlert(userId: string, id: string, enabled: boolean) {
+    const a = await this.prisma.priceAlert.findUnique({ where: { id } });
+    if (!a || a.userId !== userId) throw new NotFoundException('Alert not found');
+    return this.prisma.priceAlert.update({
+      where: { id },
+      data: { enabled, ...(enabled ? { triggeredAt: null, triggeredPrice: null } : {}) },
+    });
+  }
+}
+
+function csvEscape(v: string): string {
+  if (/[",\n\r]/.test(v)) return `"${v.replace(/"/g, '""')}"`;
+  return v;
 }

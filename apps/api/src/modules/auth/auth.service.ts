@@ -182,6 +182,28 @@ export class AuthService {
     return { success: true };
   }
 
+  /**
+   * Admin-only impersonation: issues a short-lived access token (15 min, no
+   * refresh) for the target user. The token includes `impersonatedBy` so the
+   * client can show a clear banner and exit cleanly.
+   * Caller (admin's audit log) tracks this in AuditLog.
+   */
+  async issueImpersonationToken(adminUserId: string, targetUserId: string) {
+    const target = await this.prisma.user.findUnique({
+      where: { id: targetUserId },
+      select: { id: true, email: true, role: true, status: true },
+    });
+    if (!target) throw new UnauthorizedException('Target user not found');
+    if (target.status !== 'ACTIVE') throw new BadRequestException('Cannot impersonate non-active user');
+    if (target.role === 'SUPER_ADMIN') throw new BadRequestException('Cannot impersonate SUPER_ADMIN');
+    const payload = {
+      sub: target.id, email: target.email, role: target.role,
+      impersonatedBy: adminUserId,
+    } as JwtPayload & { impersonatedBy: string };
+    const accessToken = await this.jwt.signAsync(payload, { expiresIn: '15m' });
+    return { accessToken, targetEmail: target.email, expiresIn: 900 };
+  }
+
   private async issueTokens(
     userId: string,
     email: string,
