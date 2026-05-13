@@ -5,7 +5,7 @@ import { io, Socket } from 'socket.io-client';
 import { tokenStore } from './api';
 
 const WS_URL =
-  process.env.NEXT_PUBLIC_WS_URL ?? 'ws://localhost:4000';
+ process.env.NEXT_PUBLIC_WS_URL ?? (typeof window !== 'undefined' ? `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}` : 'ws://localhost:4000');
 
 let socket: Socket | null = null;
 
